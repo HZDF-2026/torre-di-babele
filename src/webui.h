@@ -76,6 +76,8 @@ button.act:hover{border-color:var(--accent)}
 .gs-achieved{color:var(--accent);border:1px solid var(--accent)}
 .gs-abandoned{color:var(--bad);border:1px solid var(--bad)}
 .gchip{font-size:10px;color:var(--dim);border:1px solid var(--line);border-radius:4px;padding:0 5px;margin-left:6px}
+.hchip{font-size:10px;color:var(--warn);border:1px solid var(--warn);border-radius:4px;padding:0 5px;margin-left:6px}
+.chron{color:var(--dim);font-size:12px;white-space:pre-wrap;word-break:break-word}
 #newgoal{display:flex;gap:6px;margin-bottom:14px}
 #newgoal input{background:var(--panel2);border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:6px 10px;font:12px var(--mono)}
 #newgoal input:first-child{flex:1}
@@ -219,6 +221,8 @@ async function refreshTab(){
   }else if(tab === "tasks"){
     const ts = (await api(`/v1/rooms/${cur}/tasks`)).tasks || [];
     c.innerHTML = `<div id="newtask"><input id="nt" placeholder="new task title…">`+
+      `<label style="font-size:11px;color:var(--dim);display:flex;align-items:center;gap:4px;white-space:nowrap">`+
+      `<input type="checkbox" id="nh" title="awaits the sovereign agent 'human'; blocks generation turnover until signed"> human sign-off</label>`+
       `<button class="act" onclick="addTask()">add</button></div>`+
       (ts.length ? ts.map(t=>taskRow(t)).join("") : `<div class="empty">no tasks</div>`);
   }else if(tab === "society"){
@@ -235,6 +239,7 @@ function taskRow(t){
   return `<div class="msg" style="display:block;padding:10px 8px">
     <div><span class="mid">#${t.id}</span> <span class="badge s-${t.status}">${t.status}</span>
       ${t.gen?`<span class="gchip">gen ${t.gen}</span>`:""}
+      ${t.human?`<span class="hchip">human sign-off</span>`:""}
       <b style="margin-left:8px">${esc(t.title)}</b>
       ${t.assignee?`<span style="color:var(--accent2);margin-left:8px">@${esc(t.assignee)}</span>`:""}
       <span style="float:right">${btns.join(" ")}</span></div>
@@ -245,7 +250,7 @@ function taskRow(t){
 async function addTask(){
   const t = $("#nt").value.trim();
   if(!t) return;
-  await api(`/v1/rooms/${cur}/tasks`, {method:"POST", body:JSON.stringify({title:t, agent:me()})});
+  await api(`/v1/rooms/${cur}/tasks`, {method:"POST", body:JSON.stringify({title:t, agent:me(), human:$("#nh").checked})});
   refreshTab();
 }
 const ROLES = ["commander","recorder","executor","reviewer","tester"];
@@ -267,26 +272,32 @@ function renderSociety(s){
         <span class="gchip">declared by ${esc(g.proposer||"?")} · ${fmt(g.createdTs)}</span></div>
       <div class="gtext">${esc(g.text)}</div>
       ${g.criteria?`<div class="evi">criteria: ${esc(g.criteria)}</div>`:""}
+      ${g.oracle?`<div class="evi">oracle: ${esc(g.oracle)} <span style="color:var(--dim)">(achievement is judged solely by its {"satisfied"} answer; credentials live inside the oracle service)</span></div>`:""}
       ${g.status==="proposed"?`<div class="evi" style="color:var(--accent2)">achievement claimed by ${esc(g.achiever)} — evidence: ${esc(g.evidence)}</div>`:""}
       ${g.verifier?`<div class="evi">closed by ${esc(g.verifier)} at ${fmt(g.closedTs)}</div>`:""}
+      ${g.oracleRead?`<div class="evi">oracle reading at close: ${esc(g.oracleRead)}</div>`:""}
       ${btns.length?`<div style="margin-top:8px">${btns.join(" ")}</div>`:""}
     </div>`;
   }else{
     html += `<div id="newgoal">
       <input id="gt" placeholder="declare the god goal of this society…">
       <input id="gc" placeholder="criteria (optional)">
+      <input id="go" placeholder="oracle http:// URL (optional)" style="min-width:200px">
       <button class="act" onclick="goalSet()">set</button>
     </div>
     <div class="empty">no god goal — this room is a plain collaboration board</div>`;
   }
   const gens = s.generations || [];
   html += `<h3 class="sec">generations${s.generation?` — current: gen ${s.generation}`:""}</h3>`;
-  html += gens.length ? `<table><tr><th>#</th><th>status</th><th>born</th><th>retired</th><th>note</th></tr>`+
+  html += gens.length ? `<table><tr><th>#</th><th>status</th><th>born</th><th>retired</th><th>note</th><th>chronicle</th></tr>`+
     gens.slice().reverse().map(x=>`<tr><td>${x.n}</td><td>${x.status}</td>`+
-      `<td>${fmt(x.bornTs)}</td><td>${x.retiredTs?fmt(x.retiredTs):"—"}</td><td>${esc(x.note||"")}</td></tr>`).join("")+`</table>`
+      `<td>${fmt(x.bornTs)}</td><td>${x.retiredTs?fmt(x.retiredTs):"—"}</td><td>${esc(x.note||"")}</td>`+
+      `<td>${x.chronicle?`<span class="chron" title="${esc(x.chronicle)}">${esc(x.chronicle.length>160?x.chronicle.slice(0,160)+"…":x.chronicle)}</span> <span class="gchip">by ${esc(x.chronicler||"?")}</span>`:"—"}</td></tr>`).join("")+`</table>`
     : `<div class="empty">no generations — declare a god goal to birth gen 1</div>`;
-  if(g.exists && g.status==="open")
-    html += `<div style="margin-top:8px"><button class="act" onclick="genAdvance()">force next generation</button></div>`;
+  if(g.exists && g.status==="open"){
+    html += `<div style="margin-top:8px"><button class="act" onclick="genAdvance()">force next generation</button>`+
+      (s.generation?` <button class="act" onclick="genChronicle()">write chronicle (recorder)</button>`:"")+`</div>`;
+  }
   const roles = s.roles || [];
   html += `<h3 class="sec">roles — division of labor</h3><div>`+
     ROLES.map(r=>{
@@ -307,7 +318,15 @@ async function goalSet(){
   if(!t){ alert("goal text required"); return; }
   try{
     await api(`/v1/rooms/${cur}/goal`, {method:"POST",
-      body:JSON.stringify({text:t, criteria:$("#gc").value.trim(), agent:me()})});
+      body:JSON.stringify({text:t, criteria:$("#gc").value.trim(), oracle:$("#go").value.trim(), agent:me()})});
+    refreshTab();
+  }catch(e){ if(String(e.message)!=="401") alert(e.message||"failed"); }
+}
+async function genChronicle(){
+  const text = prompt("chronicle — the distilled closing record of the active generation (max 4096 chars):");
+  if(text==null) return;
+  try{
+    await api(`/v1/rooms/${cur}/gen/chronicle`, {method:"POST", body:JSON.stringify({agent:me(), chronicle:text})});
     refreshTab();
   }catch(e){ if(String(e.message)!=="401") alert(e.message||"failed"); }
 }

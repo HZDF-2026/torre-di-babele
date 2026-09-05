@@ -283,7 +283,7 @@ bool HttpServer::run(std::string& errOut) {
 
 ClientResult httpClient(const std::string& host, int port, const std::string& method,
                         const std::string& rawTarget, const std::string& body,
-                        const std::string& bearer) {
+                        const std::string& bearer, long long timeoutMs) {
     ClientResult r;
     std::string err;
     if (!netInit(err)) {
@@ -294,6 +294,19 @@ ClientResult httpClient(const std::string& host, int port, const std::string& me
     if (s == kBadSock) {
         r.err = "socket() failed";
         return r;
+    }
+    if (timeoutMs > 0) {
+#ifdef _WIN32
+        DWORD ms = static_cast<DWORD>(timeoutMs);
+        ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&ms), sizeof ms);
+        ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&ms), sizeof ms);
+#else
+        timeval tv{};
+        tv.tv_sec = timeoutMs / 1000;
+        tv.tv_usec = static_cast<suseconds_t>((timeoutMs % 1000) * 1000);
+        ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+#endif
     }
     sockaddr_in addr;
     std::memset(&addr, 0, sizeof addr);

@@ -8,12 +8,15 @@
 //   POST /v1/rooms/{r}/release           {"agent","claim_id"?,"scope"?}
 //   GET  /v1/rooms/{r}/claims
 //   GET  /v1/rooms/{r}/board              GET/PUT /v1/rooms/{r}/board/{key}
-//   GET  /v1/rooms/{r}/tasks              POST /v1/rooms/{r}/tasks {"title",...}
+//   GET  /v1/rooms/{r}/tasks              POST /v1/rooms/{r}/tasks {"title",...,"human"?}
 //   POST /v1/rooms/{r}/tasks/{id}/claim|submit|verify
 //   GET  /v1/rooms/{r}/society
 //   POST /v1/rooms/{r}/goal                GET /v1/rooms/{r}/goal
 //   POST /v1/rooms/{r}/goal/achieve|verify|abandon
+//         (verify accept: the server fetches the goal's oracle, if declared,
+//          and refuses to close the society unless it says satisfied)
 //   GET  /v1/rooms/{r}/gen                 POST /v1/rooms/{r}/gen/advance
+//   POST /v1/rooms/{r}/gen/chronicle       {"agent","chronicle"}
 //   GET  /v1/rooms/{r}/roles               POST /v1/rooms/{r}/roles {"role","agent"}
 //   GET  /v1/rooms/{r}/verify
 //   GET  /v1/search?q&room&limit
@@ -113,6 +116,7 @@ Json taskJson(const Task& t) {
     j.set("createdTs", Json::number(static_cast<double>(t.createdTs)));
     j.set("updatedTs", Json::number(static_cast<double>(t.updatedTs)));
     j.set("gen", Json::number(static_cast<double>(t.gen)));
+    j.set("human", Json::boolean(t.human));
     return j;
 }
 
@@ -126,6 +130,9 @@ Json goalJson(const Goal& g) {
     j.set("achiever", Json::string(g.achiever));
     j.set("evidence", Json::string(g.evidence));
     j.set("verifier", Json::string(g.verifier));
+    j.set("oracle", Json::string(g.oracle));
+    j.set("oracleRead", Json::string(g.oracleRead));
+    j.set("oracleReadTs", Json::number(static_cast<double>(g.oracleReadTs)));
     j.set("createdTs", Json::number(static_cast<double>(g.createdTs)));
     j.set("closedTs", Json::number(static_cast<double>(g.closedTs)));
     return j;
@@ -138,6 +145,9 @@ Json genJson(const Generation& g) {
     j.set("bornTs", Json::number(static_cast<double>(g.bornTs)));
     j.set("retiredTs", Json::number(static_cast<double>(g.retiredTs)));
     j.set("note", Json::string(g.note));
+    j.set("chronicle", Json::string(g.chronicle));
+    j.set("chronicler", Json::string(g.chronicler));
+    j.set("chronicleTs", Json::number(static_cast<double>(g.chronicleTs)));
     return j;
 }
 
@@ -403,10 +413,12 @@ HttpHandler makeApiRouter(RoomStore& store, const std::string& token) {
                 if (req.method == "POST") {
                     Json body;
                     if (!parseBody(req, body)) return err(400, "body must be a JSON object");
+                    bool human = false;
+                    if (const Json* h = body.get("human"); h && h->isBool()) human = h->b;
                     try {
                         Task t = store.taskCreate(room, strField(body, "title"),
                                                    strField(body, "detail"),
-                                                   strField(body, "agent", "anon"));
+                                                   strField(body, "agent", "anon"), human);
                         return json(200, taskJson(t));
                     } catch (const std::exception& e) {
                         return err(400, e.what());
@@ -474,7 +486,7 @@ HttpHandler makeApiRouter(RoomStore& store, const std::string& token) {
                     if (!parseBody(req, body)) return err(400, "body must be a JSON object");
                     try {
                         store.goalSet(room, strField(body, "text"), strField(body, "criteria"),
-                                     strField(body, "agent", "anon"));
+                                     strField(body, "oracle"), strField(body, "agent", "anon"));
                         Json j = Json::object();
                         j.set("room", Json::string(room));
                         j.set("goal", goalJson(store.society(room).goal));
@@ -508,7 +520,19 @@ HttpHandler makeApiRouter(RoomStore& store, const std::string& token) {
                 try {
                     const Json* a = body.get("accept");
                     bool accept = !(a && a->isBool()) || a->b;
-                    store.goalVerify(room, strField(body, "agent"), accept);
+                    // Fetch the oracle (if declared) BEFORE entering the store:
+                    // readOracle blocks on sockets up to 5s and must never hold
+                    // the store mutex. goalVerify re-validates goal state under
+                    // its own lock and is the sole judge of the reading.
+                    OracleReading oracle;
+                    if (accept) {
+                        Society s = store.society(room);
+                        if (s.goal.exists && s.goal.status == "proposed" &&
+                            !s.goal.oracle.empty())
+                            oracle = readOracle(s.goal.oracle);
+                    }
+                    store.goalVerify(room, strField(body, "agent"), accept,
+                                     accept ? &oracle : nullptr);
                 } catch (const std::exception& e) {
                     return err(400, e.what());
                 }
@@ -550,6 +574,25 @@ HttpHandler makeApiRouter(RoomStore& store, const std::string& token) {
                 if (!parseBody(req, body)) return err(400, "body must be a JSON object");
                 try {
                     store.genAdvance(room, strField(body, "agent"), strField(body, "note"));
+                } catch (const std::exception& e) {
+                    return err(400, e.what());
+                }
+                Society s = store.society(room);
+                Json j = Json::object();
+                j.set("room", Json::string(room));
+                j.set("generation", Json::number(static_cast<double>(activeGen(s))));
+                Json gens = Json::array();
+                for (const Generation& g : s.gens) gens.push(genJson(g));
+                j.set("generations", std::move(gens));
+                return json(200, j);
+            }
+
+            if (rest == "gen/chronicle" && req.method == "POST") {
+                Json body;
+                if (!parseBody(req, body)) return err(400, "body must be a JSON object");
+                try {
+                    store.genChronicle(room, strField(body, "agent", "anon"),
+                                      strField(body, "chronicle"));
                 } catch (const std::exception& e) {
                     return err(400, e.what());
                 }

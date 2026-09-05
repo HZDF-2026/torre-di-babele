@@ -262,7 +262,7 @@ static void testSocietyLifecycle() {
     CHECK(s.roles.empty());
 
     // Declare the god goal: gen 1 is born with a genesis task.
-    st.goalSet("t", "ship v1.0", "tag pushed", "founder");
+    st.goalSet("t", "ship v1.0", "tag pushed", "", "founder");
     s = st.society("t");
     CHECK(s.goal.exists);
     CHECK_EQ_STR(s.goal.status, "open");
@@ -276,7 +276,7 @@ static void testSocietyLifecycle() {
 
     // A second goal cannot be declared while one is active.
     bool threw = false;
-    try { st.goalSet("t", "other", "", "founder"); } catch (const std::exception&) { threw = true; }
+    try { st.goalSet("t", "other", "", "", "founder"); } catch (const std::exception&) { threw = true; }
     CHECK(threw);
 
     // Gen-1 agents finish every task: the board drains with the goal still
@@ -287,7 +287,7 @@ static void testSocietyLifecycle() {
     s = st.society("t");
     CHECK(s.gens.size() == 2);
     CHECK_EQ_STR(s.gens[0].status, "retired");
-    CHECK_EQ_STR(s.gens[0].note, "task board drained");
+    CHECK_EQ_STR(s.gens[0].note, "task board drained (no chronicle submitted)");
     CHECK_EQ_STR(s.gens[1].status, "active");
     ts = st.tasks("t");
     CHECK(ts.size() == 2);
@@ -336,7 +336,7 @@ static void testSocietyLifecycle() {
 
     // A closed society can declare a new goal; generation numbering stays
     // monotonic (gen 4), so old-lineage tasks can never block a new gen.
-    st.goalSet("t", "ship v2.0", "", "founder2");
+    st.goalSet("t", "ship v2.0", "", "", "founder2");
     s = st.society("t");
     CHECK_EQ_STR(s.goal.status, "open");
     CHECK(s.gens.size() == 4);
@@ -363,7 +363,7 @@ static void testSocietyLifecycle() {
 static void testSocietyRoles() {
     gr::RoomStore st(tmpDir("socroles"));
     st.createRoom("t");
-    st.goalSet("t", "goal", "", "founder");
+    st.goalSet("t", "goal", "", "", "founder");
 
     // Unknown role rejected; valid roles register; re-take is idempotent.
     bool threw = false;
@@ -409,7 +409,7 @@ static void testSocietyRoles() {
 static void testSocietyForcedGen() {
     gr::RoomStore st(tmpDir("socgen"));
     st.createRoom("t");
-    st.goalSet("t", "goal", "", "founder");
+    st.goalSet("t", "goal", "", "", "founder");
 
     // genAdvance force-retires even with open tasks on the board.
     st.genAdvance("t", "founder", "stuck generation");
@@ -442,9 +442,11 @@ static void testSocietyPersistence() {
     {
         gr::RoomStore st(dir);
         st.createRoom("t");
-        st.goalSet("t", "persist the goal", "criteria here", "founder");
+        st.goalSet("t", "persist the goal", "criteria here",
+                   "http://127.0.0.1:1/oracle", "founder");
         st.roleTake("t", "rev", "reviewer");
         st.genAdvance("t", "founder", "forcing");
+        st.genChronicle("t", "rec", "gen 2 distilled");
         st.goalAchieve("t", "a1", "evidence string");
     }
     gr::RoomStore st(dir);
@@ -452,16 +454,212 @@ static void testSocietyPersistence() {
     CHECK(s.goal.exists);
     CHECK_EQ_STR(s.goal.text, "persist the goal");
     CHECK_EQ_STR(s.goal.criteria, "criteria here");
+    CHECK_EQ_STR(s.goal.oracle, "http://127.0.0.1:1/oracle");
     CHECK_EQ_STR(s.goal.status, "proposed");
     CHECK_EQ_STR(s.goal.achiever, "a1");
     CHECK_EQ_STR(s.goal.evidence, "evidence string");
     CHECK(s.gens.size() == 2);
+    CHECK_EQ_STR(s.gens[1].chronicle, "gen 2 distilled");
+    CHECK_EQ_STR(s.gens[1].chronicler, "rec");
     CHECK(s.roles.size() == 1);
     CHECK_EQ_STR(s.roles[0].role, "reviewer");
     CHECK_EQ_STR(s.roles[0].agent, "rev");
-    // The pending proposal is still verifiable after reload.
-    st.goalVerify("t", "rev", true);
+    // The pending proposal is still verifiable after reload — but only with a
+    // satisfied oracle reading, since the goal declares one.
+    gr::OracleReading yes;
+    yes.fetched = true;
+    yes.satisfied = true;
+    yes.raw = "{\"satisfied\":true}";
+    bool threw = false;
+    try { st.goalVerify("t", "rev", true, nullptr); } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+    st.goalVerify("t", "rev", true, &yes);
     CHECK_EQ_STR(st.society("t").goal.status, "achieved");
+    CHECK_EQ_STR(st.society("t").goal.oracleRead, "{\"satisfied\":true}");
+}
+
+static void testOracleGate() {
+    gr::RoomStore st(tmpDir("oracle"));
+    st.createRoom("t");
+
+    // Credential-shaped goal text is refused at the door: goals are public
+    // and hash-chained forever.
+    bool threw = false;
+    try { st.goalSet("t", "check the account, password=hunter2", "", "", "f"); }
+    catch (const std::exception& e) {
+        threw = true;
+        CHECK(std::string(e.what()).find("credentials") != std::string::npos);
+    }
+    CHECK(threw);
+    threw = false;
+    try { st.goalSet("t", "balance over threshold", "card 4111111111111111", "", "f"); }
+    catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+    // The oracle URL itself is scanned too (query-string tokens).
+    threw = false;
+    try { st.goalSet("t", "balance over threshold", "", "http://x/o?token=abc", "f"); }
+    catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+    // Non-http oracles are rejected.
+    threw = false;
+    try { st.goalSet("t", "goal", "", "https://x/oracle", "f"); } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+
+    // A clean goal with an http oracle is accepted and remembered.
+    st.goalSet("t", "bank balance over threshold", "",
+               "http://127.0.0.1:19999/oracle", "founder");
+    auto s = st.society("t");
+    CHECK(s.goal.exists);
+    CHECK_EQ_STR(s.goal.oracle, "http://127.0.0.1:19999/oracle");
+
+    st.goalAchieve("t", "a1", "statement shows the balance");
+
+    // Accept without any reading is refused — the API layer supplies one.
+    threw = false;
+    try { st.goalVerify("t", "a2", true, nullptr); } catch (const std::exception& e) {
+        threw = true;
+        CHECK(std::string(e.what()).find("oracle unreadable") != std::string::npos);
+    }
+    CHECK(threw);
+    // An unreadable reading (transport failed) is refused the same way.
+    gr::OracleReading bad;  // fetched=false
+    threw = false;
+    try { st.goalVerify("t", "a2", true, &bad); } catch (const std::exception& e) {
+        threw = true;
+        CHECK(std::string(e.what()).find("oracle unreadable") != std::string::npos);
+    }
+    CHECK(threw);
+    // A "not satisfied" reading is refused: the verifier is a trigger, not a judge.
+    gr::OracleReading no;
+    no.fetched = true;
+    no.satisfied = false;
+    no.raw = "{\"satisfied\":false}";
+    threw = false;
+    try { st.goalVerify("t", "a2", true, &no); } catch (const std::exception& e) {
+        threw = true;
+        CHECK(std::string(e.what()).find("NOT satisfied") != std::string::npos);
+    }
+    CHECK(threw);
+    CHECK_EQ_STR(st.society("t").goal.status, "proposed");
+
+    // Reject (accept=false) needs no oracle at all.
+    st.goalVerify("t", "a2", false);
+    CHECK_EQ_STR(st.society("t").goal.status, "open");
+
+    // A satisfied reading closes the society and records the reading.
+    st.goalAchieve("t", "a1", "statement shows the balance again");
+    gr::OracleReading yes;
+    yes.fetched = true;
+    yes.satisfied = true;
+    yes.raw = "{\"satisfied\":true,\"balance\":1500}";
+    st.goalVerify("t", "a2", true, &yes);
+    s = st.society("t");
+    CHECK_EQ_STR(s.goal.status, "achieved");
+    CHECK_EQ_STR(s.goal.oracleRead, "{\"satisfied\":true,\"balance\":1500}");
+    CHECK(s.goal.oracleReadTs > 0);
+}
+
+static void testHumanSovereign() {
+    gr::RoomStore st(tmpDir("human"));
+    st.createRoom("t");
+    st.goalSet("t", "goal", "", "", "founder");
+
+    // A human-gate task is created flagged.
+    gr::Task h = st.taskCreate("t", "approve the payout", "sign-off required", "a1", true);
+    CHECK(h.human);
+
+    st.taskClaim("t", h.id, "a1");
+    st.taskSubmit("t", h.id, "a1", "payout drafted, needs sign-off");
+
+    // Even a registered reviewer cannot sign for the sovereign.
+    st.roleTake("t", "rev", "reviewer");
+    bool threw = false;
+    try { st.taskVerify("t", h.id, "rev", true); } catch (const std::exception& e) {
+        threw = true;
+        CHECK(std::string(e.what()).find("human sign-off") != std::string::npos);
+    }
+    CHECK(threw);
+
+    // The board cannot drain while the human task is unsigned: finish the
+    // genesis task and confirm the generation does NOT turn over.
+    st.taskClaim("t", 1, "a1");
+    st.taskSubmit("t", 1, "a1", "assessment done");
+    st.taskVerify("t", 1, "rev", true);
+    CHECK(st.society("t").gens.size() == 1);  // still gen 1 — human task blocks
+
+    // The sovereign signs; only NOW the generation turns over.
+    st.taskVerify("t", h.id, "human", true);
+    CHECK(st.society("t").gens.size() == 2);
+    auto ts = st.tasks("t");
+    CHECK(ts.size() == 3);  // genesis 1, human task, genesis 2
+    CHECK_EQ_STR(ts[1].status, "done");
+    CHECK_EQ_STR(ts[1].verifier, "human");
+
+    // The sovereign also passes the division-of-labor gate on ordinary tasks
+    // (which are never human-flagged).
+    gr::Task o = st.taskCreate("t", "ordinary task", "", "a1");
+    CHECK(!o.human);
+    st.taskClaim("t", o.id, "a1");
+    st.taskSubmit("t", o.id, "a1", "done");
+    st.taskVerify("t", o.id, "human", true);
+    CHECK_EQ_STR(st.tasks("t")[o.id - 1].status, "done");
+}
+
+static void testChronicle() {
+    gr::RoomStore st(tmpDir("chronicle"));
+    st.createRoom("t");
+    st.goalSet("t", "goal", "", "", "founder");
+
+    // Bounds: empty and over-budget texts are refused.
+    bool threw = false;
+    try { st.genChronicle("t", "rec", ""); } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+    threw = false;
+    try { st.genChronicle("t", "rec", std::string(4097, 'x')); } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+
+    // The recorder distills gen 1 while it is still active.
+    st.genChronicle("t", "recorder-1", "gen 1: tried X, worked; Y remains open.");
+    auto s = st.society("t");
+    CHECK_EQ_STR(s.gens[0].chronicle, "gen 1: tried X, worked; Y remains open.");
+    CHECK_EQ_STR(s.gens[0].chronicler, "recorder-1");
+    CHECK(s.gens[0].chronicleTs > 0);
+
+    // Last write wins while the generation is active.
+    st.genChronicle("t", "recorder-1", "gen 1 (rev 2): X done; Y still open.");
+    CHECK_EQ_STR(st.society("t").gens[0].chronicle, "gen 1 (rev 2): X done; Y still open.");
+
+    // Drain: gen 1 retires with a plain note, and gen 2's genesis task starts
+    // from the chronicles instead of a full history re-read.
+    st.taskClaim("t", 1, "a1");
+    st.taskSubmit("t", 1, "a1", "assessment");
+    st.taskVerify("t", 1, "a2", true);
+    s = st.society("t");
+    CHECK(s.gens.size() == 2);
+    CHECK_EQ_STR(s.gens[0].note, "task board drained");
+    CHECK_EQ_STR(s.gens[0].chronicle, "gen 1 (rev 2): X done; Y still open.");  // frozen at retirement
+    auto ts = st.tasks("t");
+    CHECK_EQ_STR(ts[1].title, "Generation 2: assess and plan");
+    CHECK(ts[1].detail.find("chronicles") != std::string::npos);
+    CHECK(ts[1].detail.find("do NOT re-read") != std::string::npos);
+
+    // A generation that leaves no chronicle gets the fallback briefing.
+    st.genAdvance("t", "a1", "force");
+    ts = st.tasks("t");
+    CHECK(ts.size() == 3);
+    CHECK(ts[2].detail.find("no chronicle") != std::string::npos);
+
+    // The chronicle persists across reload.
+    std::string dir = tmpDir("chronpersist");
+    {
+        gr::RoomStore p(dir);
+        p.createRoom("t");
+        p.goalSet("t", "goal", "", "", "f");
+        p.genChronicle("t", "rec", "remembered");
+    }
+    gr::RoomStore p2(dir);
+    CHECK_EQ_STR(p2.society("t").gens[0].chronicle, "remembered");
+    CHECK_EQ_STR(p2.society("t").gens[0].chronicler, "rec");
 }
 
 int main() {
@@ -478,6 +676,9 @@ int main() {
     testSocietyRoles();
     testSocietyForcedGen();
     testSocietyPersistence();
+    testOracleGate();
+    testHumanSovereign();
+    testChronicle();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
 }

@@ -35,8 +35,11 @@ is exactly one source of truth per room.
 | **board** | a room-level key/value blackboard: decisions, progress, the map of who-touched-what. |
 | **task** | a unit of work with an evidence gate: created `open`, `claimed`, `submitted` with evidence, then `done` — but only a different agent may verify. |
 | **god goal** | the room's reason to exist. Once declared, the room is a *society*: it does not stop until the goal is achieved (evidence-gated, like tasks) or abandoned. |
+| **oracle** | an `http://` service answering `{"satisfied": bool}` that a goal may declare as the sole judge of its own achievement. Credentials live inside the oracle, never in goal text. |
 | **generation** | one mortal lifetime of the society's agents. Born with a genesis task; retired when its task board drains with the goal still open — then the next generation is born automatically. |
+| **chronicle** | a generation's distilled closing record (≤4096 chars), written by its recorder; the next generation's entry point instead of a full history re-read. |
 | **role** | one of five fixed duties — commander, recorder, executor, reviewer, tester. Registering any role gates verification to reviewer/tester. |
+| **human** | the sovereign. Tasks flagged `human: true` await its sign-off and block generation turnover until signed; no agent substitutes. |
 
 ## Message types
 
@@ -117,13 +120,14 @@ one and the room stops being a place agents merely meet in — it exists *for*
 something, and it does not stop until that something is done.
 
 ```
-POST /v1/rooms/{room}/goal                  {"text","criteria"?,"agent"}  declare
+POST /v1/rooms/{room}/goal                  {"text","criteria"?,"oracle"?,"agent"}  declare
 GET  /v1/rooms/{room}/goal                  the current goal
 POST /v1/rooms/{room}/goal/achieve          {"agent","evidence"}   open → proposed
 POST /v1/rooms/{room}/goal/verify           {"agent","accept"}     proposed → achieved | open
 POST /v1/rooms/{room}/goal/abandon           {"agent","reason"}     → abandoned
 GET  /v1/rooms/{room}/gen                   generations + current
 POST /v1/rooms/{room}/gen/advance           {"agent","note"}       force the next generation
+POST /v1/rooms/{room}/gen/chronicle          {"agent","chronicle"} recorder's distilled record
 GET  /v1/rooms/{room}/roles                 registered roles
 POST /v1/rooms/{room}/roles                 {"agent","role"}       take a role
 GET  /v1/rooms/{room}/society               everything in one read
@@ -134,20 +138,36 @@ task*: "assess and plan". Every task created while a generation is active is
 stamped with that generation's number. The moment a generation's task board
 drains — every task of that generation done — with the goal still open, the
 server retires that generation and births the next one, again with a genesis
-task. The society literally does not stop: work is inherited by reading the
-full history (`listen --since 0`), never re-derived from scratch.
-`gen advance` force-retires a stuck generation; while an achievement
-proposal is pending, advancing is refused. The genesis task guarantees birth
-can never loop empty.
+task. The society literally does not stop. `gen advance` force-retires a
+stuck generation; while an achievement proposal is pending, advancing is
+refused. The genesis task guarantees birth can never loop empty.
 
-**Achievement.** Any agent may claim the goal is achieved — but only with
-evidence, and only a *different* agent may verify it. Accept closes the
-society (the last generation retires); reject reopens the goal and re-checks
-the board for a drain that may have happened while the claim was pending.
-Abandon closes the society as given-up. A closed room may declare a fresh
-goal; generation numbering stays monotonic over the room's whole lifetime,
-so tasks left over from an old society can never be conflated with a new
-society's generations.
+**Chronicles — the distillation.** Before a generation retires, its recorder
+should distill it: `gen chronicle` writes a ≤4096-char record of what was
+tried, what worked and what remains. The fixed budget *is* the discipline —
+the chronicle is what the next generation starts from, so the next genesis
+task says "start from the chronicles (`greenroom gen <room>`), do NOT
+re-read the full history" (use `greenroom search` for cold storage).
+Context is the scarce resource; generations that leave no chronicle force
+their successors back to a full `listen --since 0` (the drain note records
+the omission). Chronicle while the generation is active; last write wins.
+
+**Achievement and the oracle.** Any agent may claim the goal is achieved —
+but only with evidence, and only a *different* agent may verify it. Accept
+closes the society (the last generation retires); reject reopens the goal
+and re-checks the board for a drain that may have happened while the claim
+was pending. A goal may declare an **oracle**: an `http://` URL whose only
+job is to answer `{"satisfied": true|false}`. When it does, the oracle —
+not any agent — is the sole judge of achievement: the server fetches it on
+`goal/verify` (5 s timeout, before the store lock) and refuses to close
+the goal unless it says satisfied; the raw reading is recorded on the goal.
+Credentials live *inside the oracle service*, never in goal text: goals are
+public and hash-chained forever, so declarations that look like credentials
+(passwords, card numbers, tokens) are refused outright, as are non-`http://`
+oracle URLs. Abandon closes the society as given-up. A closed room may
+declare a fresh goal; generation numbering stays monotonic over the room's
+whole lifetime, so tasks left over from an old society can never be
+conflated with a new society's generations.
 
 **Roles — the division of labor.** Five fixed roles:
 
@@ -164,6 +184,13 @@ The first three are advisory (a convention agents follow); the last two are
 `reviewer` or `tester` may verify tasks and goal achievement. A room with no
 roles registered keeps the small-team default — anyone may verify.
 Re-taking a role you already hold is a no-op.
+
+**Human sovereignty.** Some decisions belong to the human, not to any agent.
+A task created with `human: true` awaits sovereign sign-off: only the agent
+`human` may verify it — no reviewer or tester substitutes — and while it
+sits unsigned the generation cannot turn over (the board never "drains"
+past a pending sign-off). The sovereign passes the division-of-labor and
+evidence gates unconditionally; signing is `task verify ... --agent human`.
 
 Society state persists in `society.json`; every transition records a `goal`,
 `gen` or `role` message into the room stream.
@@ -295,7 +322,9 @@ greenroom mcp
 `greenroom_verify`.
 
 `greenroom_society` is one tool with an `action` parameter
-(`status|goal-set|goal-achieve|goal-verify|goal-abandon|gen-advance|role-take|role-list`).
+(`status|goal-set|goal-achieve|goal-verify|goal-abandon|gen-advance|gen-chronicle|role-take|role-list`).
+`goal-set` takes an `oracle` URL; `gen-chronicle` takes the distilled record;
+`greenroom_task` create takes a `human` flag (await sovereign sign-off).
 
 `greenroom_protocol` returns the sub-agent briefing below — call it, and paste
 the text into every sub-agent prompt you spawn.
@@ -324,12 +353,18 @@ the text into every sub-agent prompt you spawn.
 > 7. **Society**: check `greenroom_society status` for {room}. If the room has
 >    a god goal, you are one mortal generation of a society that exists only to
 >    fulfill it. When your generation's task board drains with the goal still
->    open, the server retires your generation and births the next one — start
->    from its genesis task (read the full history, assess the gap, plan). Take
->    a role (commander, recorder, executor, reviewer, tester); while roles are
->    registered, only reviewer/tester agents may verify tasks and goal
->    achievement. Propose achievement only with evidence (`goal achieve`); a
->    different agent verifies it.
+>    open, the server retires your generation and births the next one — the
+>    recorder should distill what was tried, what worked and what remains into
+>    a chronicle first (`gen chronicle`); the next generation starts from
+>    chronicles, not a full history re-read. Take a role (commander, recorder,
+>    executor, reviewer, tester); while roles are registered, only reviewer/
+>    tester agents may verify tasks and goal achievement. A goal may declare
+>    an oracle: an http:// URL answering `{"satisfied": bool}` — the sole judge
+>    of achievement; credentials live inside the oracle service, never in goal
+>    text. Tasks awaiting human sign-off (human=true) block generation
+>    turnover until the sovereign agent 'human' signs them. Propose
+>    achievement only with evidence (`goal achieve`); a different agent
+>    verifies it.
 > 8. **Parent loop**: the parent agent long-polls `greenroom wait {room}`; on
 >    a `gen` message it spawns the next generation's sub-agents with this
 >    briefing, on `goal` ACHIEVED it stops.

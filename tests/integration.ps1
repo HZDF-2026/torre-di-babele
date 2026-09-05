@@ -216,6 +216,104 @@ try {
     $v = Api "GET" "/v1/rooms/soc-room/verify"
     Check "hash chain verifies with society" ($v.ok -eq $true)
 
+    # --- P8: oracle predicate, human sovereignty, chronicle ------------------
+    # A hand-rolled TCP oracle: plain sockets need no HTTP.SYS urlacl. It answers
+    # every request with {"satisfied":true} — the sole judge of achievement.
+    $oraclePort = 7793
+    $oracleJob = Start-Job -ScriptBlock {
+        param($port)
+        $body = '{"satisfied":true}'
+        $resp = [Text.Encoding]::ASCII.GetBytes(
+            "HTTP/1.1 200 OK`r`nContent-Type: application/json`r`nContent-Length: $($body.Length)`r`nConnection: close`r`n`r`n" + $body)
+        $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $port)
+        $l.Start()
+        try {
+            for (;;) {
+                $c = $l.AcceptTcpClient()
+                try {
+                    $buf = New-Object byte[] 4096
+                    $null = $c.GetStream().Read($buf, 0, $buf.Length)
+                    $c.GetStream().Write($resp, 0, $resp.Length)
+                    $c.GetStream().Flush()
+                } catch {}
+                $c.Close()
+            }
+        } finally { $l.Stop() }
+    } -ArgumentList $oraclePort
+
+    try {
+        $oracleUp = $false
+        for ($i = 0; $i -lt 30; $i++) {
+            try {
+                $probe = New-Object System.Net.Sockets.TcpClient
+                $probe.Connect("127.0.0.1", $oraclePort)
+                $probe.Close()
+                $oracleUp = $true
+                break
+            } catch { Start-Sleep -Milliseconds 200 }
+        }
+        Check "oracle stub up" $oracleUp
+
+        $null = Api "POST" "/v1/rooms" '{"name":"soc2"}'
+
+        # goals are public and hash-chained forever — credential scan and URL
+        # scheme validation refuse unsafe declarations
+        $r = Api "POST" "/v1/rooms/soc2/goal" '{"text":"balance over 1000, password=hunter2","agent":"f"}'
+        Check "goal with credentials refused" ($r._status -ge 400 -and (($r.error -join "") -match "credentials"))
+        $r = Api "POST" "/v1/rooms/soc2/goal" '{"text":"goal","oracle":"ftp://x/oracle","agent":"f"}'
+        Check "non-http oracle refused" ($r._status -ge 400 -and (($r.error -join "") -match "http://"))
+
+        $g = Api "POST" "/v1/rooms/soc2/goal" '{"text":"bank balance over threshold","criteria":"the oracle alone judges","oracle":"http://127.0.0.1:7793/oracle","agent":"founder"}'
+        Check "goal set with oracle" ($g.goal.status -eq "open" -and $g.goal.oracle -eq "http://127.0.0.1:7793/oracle")
+
+        # a task awaiting human sign-off blocks generation turnover
+        $ht = Api "POST" "/v1/rooms/soc2/tasks" '{"title":"approve the payout","detail":"sign-off","agent":"alice","human":true}'
+        Check "human task created flagged" ($ht.human -eq $true)
+
+        $null = Api "POST" "/v1/rooms/soc2/roles" '{"agent":"bob","role":"reviewer"}'
+        $genesis = (Api "GET" "/v1/rooms/soc2/tasks").tasks | Where-Object { $_.title -like "Generation*" }
+        $null = Api "POST" "/v1/rooms/soc2/tasks/$($genesis.id)/claim" '{"agent":"alice"}'
+        $null = Api "POST" "/v1/rooms/soc2/tasks/$($genesis.id)/submit" '{"agent":"alice","evidence":"assessed"}'
+        $null = Api "POST" "/v1/rooms/soc2/tasks/$($ht.id)/claim" '{"agent":"alice"}'
+        $null = Api "POST" "/v1/rooms/soc2/tasks/$($ht.id)/submit" '{"agent":"alice","evidence":"payout drafted"}'
+        $r = Api "POST" "/v1/rooms/soc2/tasks/$($genesis.id)/verify" '{"agent":"bob","accept":true}'
+        Check "genesis verified by reviewer" ($r.status -eq "done")
+        $r = Api "POST" "/v1/rooms/soc2/tasks/$($ht.id)/verify" '{"agent":"bob","accept":true}'
+        Check "reviewer cannot sign for the sovereign" ($r._status -ge 400 -and (($r.error -join "") -match "human sign-off"))
+        Check "human task blocks the drain" ((Api "GET" "/v1/rooms/soc2/society").generation -eq 1)
+
+        # chronicle: budget-bounded distillation, recorded on the active gen
+        $r = Api "POST" "/v1/rooms/soc2/gen/chronicle" '{"agent":"recorder","chronicle":""}'
+        Check "empty chronicle refused" ($r._status -ge 400)
+        $c = Api "POST" "/v1/rooms/soc2/gen/chronicle" '{"agent":"recorder","chronicle":"gen 1: oracle wired, sovereign gate held; balance verdict still open."}'
+        Check "chronicle recorded" ($c.generations[0].chronicle -like "*oracle wired*" -and $c.generations[0].chronicler -eq "recorder")
+
+        # the sovereign signs; only now does the generation turn over
+        $r = Api "POST" "/v1/rooms/soc2/tasks/$($ht.id)/verify" '{"agent":"human","accept":true}'
+        Check "sovereign signs the task" ($r.status -eq "done" -and $r.verifier -eq "human")
+        $s = Api "GET" "/v1/rooms/soc2/society"
+        Check "drain after sign-off" ($s.generation -eq 2 -and $s.generations[0].note -eq "task board drained")
+        $g2 = (Api "GET" "/v1/rooms/soc2/tasks").tasks | Where-Object { $_.gen -eq 2 }
+        Check "gen-2 genesis reads chronicles" ($g2.detail -match "chronicles" -and $g2.detail -match "do NOT re-read")
+
+        # achievement is judged solely by the oracle's verdict
+        $null = Api "POST" "/v1/rooms/soc2/goal/achieve" '{"agent":"alice","evidence":"balance statement"}'
+        $r = Api "POST" "/v1/rooms/soc2/goal/verify" '{"agent":"bob","accept":true}'
+        Check "oracle verdict gates achievement" ($r.goal.status -eq "achieved" -and $r.goal.oracleRead -match '"satisfied":true')
+
+        # a dead oracle refuses to close the goal; gen 3 stays active for the
+        # MCP/CLI chronicle round-trips below
+        $null = Api "POST" "/v1/rooms/soc2/goal" '{"text":"second goal","oracle":"http://127.0.0.1:9/oracle","agent":"founder"}'
+        Check "second goal births gen 3" ((Api "GET" "/v1/rooms/soc2/society").generation -eq 3)
+        $null = Api "POST" "/v1/rooms/soc2/goal/achieve" '{"agent":"alice","evidence":"claims"}'
+        $r = Api "POST" "/v1/rooms/soc2/goal/verify" '{"agent":"bob","accept":true}'
+        Check "dead oracle refuses achievement" ($r._status -ge 400 -and (($r.error -join "") -match "oracle"))
+        Check "goal stays proposed" ((Api "GET" "/v1/rooms/soc2/society").goal.status -eq "proposed")
+    } finally {
+        Stop-Job $oracleJob -ErrorAction SilentlyContinue
+        Remove-Job $oracleJob -Force -ErrorAction SilentlyContinue
+    }
+
     # --- MCP: tools/list has all tools --------------------------------------
     $env:GREENROOM_URL = $base
     $env:GREENROOM_TOKEN = $tok
@@ -250,6 +348,11 @@ try {
     $socLine = ($mcpOut | Where-Object { $_ -match '"id":6' }) -join ""
     Check "MCP greenroom_society status" ($socLine.Contains("soc-room") -and $socLine.Contains("abandoned") -and $socLine.Contains("reviewer"))
 
+    $callCh = '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"greenroom_society","arguments":{"action":"gen-chronicle","room":"soc2","agent":"mcp-rec","chronicle":"mcp chronicle entry"}}}'
+    $mcpOut = ($init + "`n" + $callCh + "`n") | & $exe mcp
+    $chLine = ($mcpOut | Where-Object { $_ -match '"id":7' }) -join ""
+    Check "MCP greenroom_society gen-chronicle" ($chLine.Contains("mcp chronicle entry") -and $chLine.Contains("mcp-rec"))
+
     # --- CLI against the token server ---------------------------------------
     $cliOut = (& $exe search "util.cpp" 2>&1) -join ""
     Check "CLI search" ($cliOut.Contains("it-room"))
@@ -265,6 +368,12 @@ try {
     Check "CLI gen" ($cliOut.Contains("gen 4") -and $cliOut.Contains("retired"))
     $cliOut = (& $exe role list soc-room 2>&1) -join ""
     Check "CLI role list" ($cliOut.Contains("reviewer"))
+    $cliOut = (& $exe gen chronicle soc2 "cli chronicle of gen 3" 2>&1) -join ""
+    Check "CLI gen chronicle" ($cliOut.Contains("cli chronicle of gen 3"))
+    $cliOut = (& $exe gen soc2 2>&1) -join ""
+    Check "CLI gen shows chronicle" ($cliOut.Contains("cli chronicle"))
+    $cliOut = (& $exe task list soc2 2>&1) -join ""
+    Check "CLI task list marks human gate" ($cliOut.Contains("[human sign-off]"))
 
     # --- persistence: restart serve, data survives --------------------------
     Stop-Process -Id $proc.Id -Force
@@ -277,6 +386,9 @@ try {
     Check "tasks survive restart" ((($list.tasks | ForEach-Object title) -contains "fix parser bug"))
     $s = Api "GET" "/v1/rooms/soc-room/society"
     Check "society survives restart" ($s.goal.status -eq "abandoned" -and $s.generations.Count -eq 4)
+    $s2 = Api "GET" "/v1/rooms/soc2/society"
+    Check "chronicle survives restart" ($s2.generations[2].chronicle -like "*cli chronicle*" -and $s2.generations[2].chronicler -eq "anon")
+    Check "goal oracle survives restart" ($s2.goal.oracle -eq "http://127.0.0.1:9/oracle" -and $s2.goal.status -eq "proposed")
     $v = Api "GET" "/v1/rooms/it-room/verify"
     Check "hash chain verifies after restart" ($v.ok -eq $true)
 

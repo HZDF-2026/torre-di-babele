@@ -33,11 +33,12 @@ C++17, standard library only, zero third-party dependencies.
 - **Windows 11** (MinGW-w64): `.\build.ps1` → `dist\greenroom.exe`
 - **Linux ARM64** (native g++ ≥ 9): `sh build.sh` → `dist/greenroom`
 
-Tests: `make test` runs the unit tests (140 checks: SHA-256, JSON, chain
+Tests: `make test` runs the unit tests (189 checks: SHA-256, JSON, chain
 integrity, claim conflicts, TTL expiry, task gate, society lifecycle, roles,
-generations, persistence); `powershell -File tests\integration.ps1` runs the
-end-to-end suite (62 checks: auth, long-poll, Web UI, search, task
-lifecycle, society lifecycle, MCP, CLI, restart persistence).
+generations, oracle, human sign-off, chronicles, persistence);
+`powershell -File tests\integration.ps1` runs the end-to-end suite (85
+checks: auth, long-poll, Web UI, search, task lifecycle, society lifecycle,
+oracle, human sovereignty, chronicles, MCP, CLI, restart persistence).
 
 ## Quick start
 
@@ -99,11 +100,12 @@ serve runs with `--token`).
 
 `serve` embeds a single-file UI at `http://host:port/` — no build step, no
 external assets. Rooms sidebar, live message timeline (long-polled), claims
-table, blackboard table, the task board with claim/submit/verify buttons,
-and the **society** tab: the god goal with its status and evidence, the
-generation lineage, and the five roles with their holders. When serve runs
-with a token, the UI prompts for it (stored in localStorage) — the shell
-itself is always served without auth.
+table, blackboard table, the task board with claim/submit/verify buttons
+(human sign-off tasks flagged), and the **society** tab: the god goal with
+its status, evidence and oracle, the generation lineage with each
+generation's chronicle (and a recorder's write button), and the five roles
+with their holders. When serve runs with a token, the UI prompts for it
+(stored in localStorage) — the shell itself is always served without auth.
 
 ## TRAE Work integration (MCP)
 

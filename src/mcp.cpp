@@ -44,12 +44,18 @@ const char* kProtocolBriefing =
     "7. Society: check `greenroom_society status` for {room}. If the room has a "
     "god goal, you are one mortal generation of a society that exists only to "
     "fulfill it. When your generation's task board drains with the goal still "
-    "open, the server retires your generation and births the next one — start "
-    "from its genesis task (read the full history, assess the gap, plan). Take a "
-    "role (commander, recorder, executor, reviewer, tester); while roles are "
-    "registered, only reviewer/tester agents may verify tasks and goal "
-    "achievement. Propose achievement only with evidence (`goal achieve`); a "
-    "different agent verifies it.\n"
+    "open, the server retires your generation and births the next one — the "
+    "recorder should distill what was tried, what worked and what remains into "
+    "a chronicle first (`gen chronicle`); the next generation starts from "
+    "chronicles, not a full history re-read. Take a role (commander, recorder, "
+    "executor, reviewer, tester); while roles are registered, only reviewer/"
+    "tester agents may verify tasks and goal achievement. A goal may declare "
+    "an oracle: an http:// URL answering {\"satisfied\": bool} — the sole judge "
+    "of achievement; credentials live inside the oracle service, never in goal "
+    "text. Tasks awaiting human sign-off (human=true) block generation "
+    "turnover until the sovereign agent 'human' signs them. Propose "
+    "achievement only with evidence (`goal achieve`); a different agent "
+    "verifies it.\n"
     "8. Parent loop: the parent agent long-polls `greenroom wait {room}`; on a "
     "`gen` message it spawns the next generation's sub-agents with this "
     "briefing, on `goal` ACHIEVED it stops.\n"
@@ -277,6 +283,12 @@ Json toolsList() {
         acc.set("type", Json::string("boolean"));
         acc.set("description", Json::string("verify: true=accept, false=reject+reopen"));
         p2.set("accept", std::move(acc));
+        Json hum = Json::object();
+        hum.set("type", Json::string("boolean"));
+        hum.set("description",
+                Json::string("create: mark as awaiting human sign-off — only agent 'human' "
+                             "may verify it and generation turnover blocks until signed"));
+        p2.set("human", std::move(hum));
         p2.set("agent", propStr("Acting agent name"));
         tools.push(toolDef("greenroom_task",
                            "Evidence-gated task board: create, claim, submit (with "
@@ -287,14 +299,19 @@ Json toolsList() {
     {
         Json p3 = Json::object();
         p3.set("action", propStr("status|goal-set|goal-achieve|goal-verify|goal-abandon|"
-                                 "gen-advance|role-take|role-list"));
+                                 "gen-advance|gen-chronicle|role-take|role-list"));
         p3.set("room", propStr("Room name"));
         p3.set("agent", propStr("Acting agent name"));
         p3.set("text", propStr("goal-set: the god goal text"));
         p3.set("criteria", propStr("goal-set: what 'achieved' means (optional)"));
+        p3.set("oracle", propStr("goal-set: http:// URL of the achievement oracle — it must "
+                                 "answer {\"satisfied\": bool}; credentials stay inside the "
+                                 "oracle service, never in goal text (optional)"));
         p3.set("evidence", propStr("goal-achieve: what proves the goal is achieved"));
         p3.set("reason", propStr("goal-abandon: why"));
         p3.set("note", propStr("gen-advance: why this generation is being retired"));
+        p3.set("chronicle", propStr("gen-chronicle: the recorder's distilled closing record "
+                                     "for the active generation, max 4096 chars"));
         p3.set("role", propStr("role-take: commander|recorder|executor|reviewer|tester"));
         Json acc = Json::object();
         acc.set("type", Json::string("boolean"));
@@ -305,7 +322,10 @@ Json toolsList() {
                            "generations of agents (a new one is born automatically "
                            "whenever a generation drains with the goal still open), and "
                            "the five roles. While roles are registered only "
-                           "reviewer/tester may verify.",
+                           "reviewer/tester may verify. With an oracle declared, goal "
+                           "verification requires it to answer satisfied. The recorder "
+                           "closes each generation with a fixed-budget chronicle the "
+                           "next generation starts from.",
                            p3, {"action", "room"}));
     }
     Json out = Json::object();
@@ -419,6 +439,8 @@ std::string callTool(const std::string& name, const Json& args) {
             body.set("title", Json::string(argStr(args, "title")));
             body.set("detail", Json::string(argStr(args, "detail")));
             body.set("agent", Json::string(agent.empty() ? "anon" : agent));
+            if (const Json* h = args.get("human"); h && h->isBool() && h->b)
+                body.set("human", Json::boolean(true));
             return post(t, base + "/tasks", body);
         }
         if (id <= 0) return "{\"error\":\"id required for claim/submit/verify\"}";
@@ -452,6 +474,7 @@ std::string callTool(const std::string& name, const Json& args) {
             Json body = Json::object();
             body.set("text", Json::string(argStr(args, "text")));
             body.set("criteria", Json::string(argStr(args, "criteria")));
+            body.set("oracle", Json::string(argStr(args, "oracle")));
             body.set("agent", Json::string(agent.empty() ? "anon" : agent));
             return post(t, base + "/goal", body);
         }
@@ -480,6 +503,12 @@ std::string callTool(const std::string& name, const Json& args) {
             body.set("agent", Json::string(agent));
             body.set("note", Json::string(argStr(args, "note")));
             return post(t, base + "/gen/advance", body);
+        }
+        if (action == "gen-chronicle") {
+            Json body = Json::object();
+            body.set("agent", Json::string(agent.empty() ? "anon" : agent));
+            body.set("chronicle", Json::string(argStr(args, "chronicle")));
+            return post(t, base + "/gen/chronicle", body);
         }
         if (action == "role-take") {
             Json body = Json::object();

@@ -56,8 +56,8 @@ $(BUILD)/%.o: %.cpp | $(BUILD)
 test: $(TEST_BIN)
 	$(TEST_BIN)
 
-$(TEST_BIN): tests/test_unit.cpp $(BUILD)/util.o $(BUILD)/sha256.o $(BUILD)/jsjson.o $(BUILD)/store.o | $(BUILD)
-	$(CXX) $(CXXFLAGS) -Isrc tests/test_unit.cpp $(BUILD)/util.o $(BUILD)/sha256.o $(BUILD)/jsjson.o $(BUILD)/store.o -o $@
+$(TEST_BIN): tests/test_unit.cpp $(BUILD)/util.o $(BUILD)/sha256.o $(BUILD)/jsjson.o $(BUILD)/store.o $(BUILD)/http.o | $(BUILD)
+	$(CXX) $(CXXFLAGS) -Isrc tests/test_unit.cpp $(BUILD)/util.o $(BUILD)/sha256.o $(BUILD)/jsjson.o $(BUILD)/store.o $(BUILD)/http.o -o $@ $(LDLIBS)
 
 clean:
 	-$(RMRF) $(call FIXPATH,$(BUILD))

@@ -62,6 +62,7 @@ struct Task {
     long long createdTs = 0;
     long long updatedTs = 0;
     int gen = 0;              // generation this task belongs to (0 = no society)
+    bool human = false;       // awaits sovereign sign-off: only agent "human" may verify
 };
 
 // The society layer (PROTOCOL.md §Society). A room becomes a society when a
@@ -77,6 +78,9 @@ struct Goal {
     std::string achiever;     // who claimed achievement (when proposed)
     std::string evidence;     // the claimed achievement evidence
     std::string verifier;     // who verified the achievement
+    std::string oracle;       // URL of the achievement oracle; the predicate lives there, credentials never do
+    std::string oracleRead;   // raw oracle reading captured when achievement was verified
+    long long oracleReadTs = 0;
     long long createdTs = 0;
     long long closedTs = 0;
 };
@@ -87,6 +91,9 @@ struct Generation {
     long long bornTs = 0;
     long long retiredTs = 0;
     std::string note;         // why it retired
+    std::string chronicle;    // recorder's distilled closing record (fixed budget, max 4096)
+    std::string chronicler;   // who wrote it
+    long long chronicleTs = 0;
 };
 
 struct RoleEntry {
@@ -100,6 +107,19 @@ struct Society {
     std::vector<Generation> gens;
     std::vector<RoleEntry> roles;
 };
+
+// One reading of a goal oracle: the raw HTTP response plus interpretation.
+// Fetched by the API layer (no store lock held) and handed to goalVerify.
+struct OracleReading {
+    bool fetched = false;     // transport succeeded and response was JSON with boolean "satisfied"
+    bool satisfied = false;   // the oracle's verdict
+    std::string raw;          // raw response body (capped)
+    std::string err;          // transport/parse error text when !fetched
+};
+
+// Fetches and interprets an oracle URL ("http://host:port/path?query" → GET →
+// {"satisfied": bool}). 5s timeout. Pure helper: touches no store state.
+OracleReading readOracle(const std::string& url);
 
 // One search hit: the message plus the room it lives in.
 struct SearchHit {
@@ -154,13 +174,16 @@ public:
     // Tasks. All throw std::runtime_error on unknown room / bad state.
     // Every transition records a "task"-type message into the room stream.
     Task taskCreate(const std::string& room, const std::string& title,
-                    const std::string& detail, const std::string& creator);
+                    const std::string& detail, const std::string& creator,
+                    bool human = false);
     std::vector<Task> tasks(const std::string& room);
     Task taskClaim(const std::string& room, long long id, const std::string& agent);
     Task taskSubmit(const std::string& room, long long id, const std::string& agent,
                     const std::string& evidence);
     // accept=false reopens the task (status back to open, assignee cleared).
     // Verifier must differ from the assignee — that is the evidence gate.
+    // human=true tasks (sovereign sign-off) may only be verified by agent
+    // "human"; on ordinary tasks "human" bypasses the role gate.
     Task taskVerify(const std::string& room, long long id, const std::string& agent,
                     bool accept);
 
@@ -172,17 +195,24 @@ public:
     // messages into the room stream.
     Society society(const std::string& room);
     // Declares the God Goal — births generation 1 with a genesis task.
-    // Throws when a goal is already active (open or proposed).
+    // Throws when a goal is already active (open or proposed). oracle: URL
+    // of an achievement oracle (GET it → {"satisfied":bool}); the goal
+    // cannot be verified achieved unless the oracle says satisfied.
     void goalSet(const std::string& room, const std::string& text,
-                 const std::string& criteria, const std::string& agent);
+                 const std::string& criteria, const std::string& oracle,
+                 const std::string& agent);
     // Claims the goal is achieved; needs evidence; sets status "proposed".
     void goalAchieve(const std::string& room, const std::string& agent,
                      const std::string& evidence);
     // Verifies a proposed achievement. Verifier must differ from the achiever
-    // and (while roles are registered) hold the reviewer or tester role.
+    // and (while roles are registered) hold the reviewer or tester role —
+    // agent "human" is the sovereign and always passes that gate. With an
+    // oracle declared, accept=true additionally requires a satisfied oracle
+    // reading (fetched by the API layer, passed in here).
     // accept=true closes the society; reject reopens the goal (and may birth
     // the next generation if the board drained meanwhile).
-    void goalVerify(const std::string& room, const std::string& agent, bool accept);
+    void goalVerify(const std::string& room, const std::string& agent, bool accept,
+                    const OracleReading* oracle = nullptr);
     // Gives up on the goal; closes the society as abandoned.
     void goalAbandon(const std::string& room, const std::string& agent,
                      const std::string& reason);
@@ -190,6 +220,12 @@ public:
     // generations whose tasks will never finish).
     void genAdvance(const std::string& room, const std::string& agent,
                     const std::string& note);
+    // The recorder's closing duty: distills the active generation into a
+    // fixed-budget chronicle (max 4096 chars, last write wins while active,
+    // frozen at retirement). The next generation's genesis task starts from
+    // chronicles instead of the full history.
+    void genChronicle(const std::string& room, const std::string& agent,
+                      const std::string& text);
     // Registers an agent under one of the five roles.
     void roleTake(const std::string& room, const std::string& agent,
                   const std::string& role);
@@ -219,7 +255,8 @@ private:
     void sweepExpired(const std::string& room, RoomData& rd);  // caller holds mutex
     Task* findTask(RoomData& rd, long long id);                // caller holds mutex
     Task createTaskLocked(const std::string& room, RoomData& rd, const std::string& title,
-                          const std::string& detail, const std::string& creator, int gen);
+                          const std::string& detail, const std::string& creator, int gen,
+                          bool human = false);
     int currentGenLocked(const RoomData& rd) const;
     bool hasVerifyRoleLocked(const RoomData& rd, const std::string& agent) const;
     void retireGenLocked(const std::string& room, RoomData& rd, const std::string& note);

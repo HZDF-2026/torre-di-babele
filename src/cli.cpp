@@ -33,18 +33,19 @@ void usage() {
               << "  greenroom claims ROOM\n"
               << "  greenroom board  get ROOM KEY\n"
               << "  greenroom board  set ROOM KEY VALUE [--agent A]\n"
-              << "  greenroom task add ROOM TITLE... [--detail D] [--agent A]\n"
+              << "  greenroom task add ROOM TITLE... [--detail D] [--agent A] [--human]\n"
               << "  greenroom task list ROOM\n"
               << "  greenroom task claim ROOM ID [--agent A]\n"
               << "  greenroom task submit ROOM ID EVIDENCE... [--agent A]\n"
               << "  greenroom task verify ROOM ID [--agent A] [--reject]\n"
-              << "  greenroom goal  set ROOM TEXT... [--criteria C] [--agent A]\n"
+              << "  greenroom goal  set ROOM TEXT... [--criteria C] [--oracle URL] [--agent A]\n"
               << "  greenroom goal  show ROOM\n"
               << "  greenroom goal  achieve ROOM EVIDENCE... [--agent A]\n"
               << "  greenroom goal  verify ROOM [--agent A] [--reject]\n"
               << "  greenroom goal  abandon ROOM REASON... [--agent A]\n"
               << "  greenroom gen   ROOM\n"
               << "  greenroom gen   advance ROOM NOTE... [--agent A]\n"
+              << "  greenroom gen   chronicle ROOM TEXT... [--agent A]\n"
               << "  greenroom role  take ROOM ROLE [--agent A]\n"
               << "  greenroom role  list ROOM\n"
               << "  greenroom verify ROOM\n"
@@ -297,7 +298,7 @@ int runCli(const std::vector<std::string>& args) {
         Parsed p;
         if (!parseArgs(rest, p, {"port", "data", "bind", "token", "agent", "ref", "since",
                                  "limit", "ttl", "id", "scope", "timeout-ms", "detail", "room",
-                                 "criteria"}))
+                                 "criteria", "oracle"}))
             return 1;
         if (cmd == "serve") return cmdServe(p);
 
@@ -392,6 +393,7 @@ int runCli(const std::vector<std::string>& args) {
                 body.set("title", Json::string(title));
                 body.set("detail", Json::string(flag(p, "detail")));
                 body.set("agent", Json::string(defaultAgent(p)));
+                if (hasFlag(p, "human")) body.set("human", Json::boolean(true));
                 ClientResult r = httpPost(t, "/v1/rooms/" + urlEnc(p.pos[1]) + "/tasks",
                                           body.dump());
                 if (!r.ok) return fail(r);
@@ -410,7 +412,10 @@ int runCli(const std::vector<std::string>& args) {
                         std::string st = tk.get("status") ? tk.get("status")->str : "?";
                         std::string ti = tk.get("title") ? tk.get("title")->str : "";
                         std::string asg = tk.get("assignee") ? tk.get("assignee")->str : "";
+                        bool human = tk.get("human") && tk.get("human")->isBool() &&
+                                     tk.get("human")->b;
                         std::cout << "#" << id << "  [" << st << "]  " << ti
+                                  << (human ? "  [human sign-off]" : "")
                                   << (asg.empty() ? "" : "  @" + asg) << "\n";
                     }
                 }
@@ -485,6 +490,7 @@ int runCli(const std::vector<std::string>& args) {
                 Json body = Json::object();
                 body.set("text", Json::string(joinRest(2)));
                 body.set("criteria", Json::string(flag(p, "criteria")));
+                body.set("oracle", Json::string(flag(p, "oracle")));
                 body.set("agent", Json::string(defaultAgent(p)));
                 ClientResult r =
                     httpPost(t, "/v1/rooms/" + urlEnc(p.pos[1]) + "/goal", body.dump());
@@ -510,6 +516,8 @@ int runCli(const std::vector<std::string>& args) {
                           << "criteria:" << (g.get("criteria") ? g.get("criteria")->str : "") << "\n"
                           << "declared by: "
                           << (g.get("proposer") ? g.get("proposer")->str : "?") << "\n";
+                if (g.get("oracle") && !g.get("oracle")->str.empty())
+                    std::cout << "oracle:  " << g.get("oracle")->str << "\n";
                 if (g.get("evidence") && !g.get("evidence")->str.empty())
                     std::cout << "evidence:" << g.get("evidence")->str << "\n";
                 if (g.get("verifier") && !g.get("verifier")->str.empty())
@@ -575,6 +583,23 @@ int runCli(const std::vector<std::string>& args) {
                 std::cout << r.body << "\n";
                 return 0;
             }
+            if (p.pos[0] == "chronicle") {
+                if (p.pos.size() < 3) {
+                    std::cerr << "error: gen chronicle needs ROOM TEXT...\n";
+                    return 1;
+                }
+                std::string text;
+                for (size_t i = 2; i < p.pos.size(); i++)
+                    text += (text.empty() ? "" : " ") + p.pos[i];
+                Json body = Json::object();
+                body.set("agent", Json::string(defaultAgent(p)));
+                body.set("chronicle", Json::string(text));
+                ClientResult r =
+                    httpPost(t, "/v1/rooms/" + urlEnc(p.pos[1]) + "/gen/chronicle", body.dump());
+                if (!r.ok) return fail(r);
+                std::cout << r.body << "\n";
+                return 0;
+            }
             ClientResult r = httpGet(t, "/v1/rooms/" + urlEnc(p.pos[0]) + "/gen");
             if (!r.ok) return fail(r);
             Json body;
@@ -591,8 +616,16 @@ int runCli(const std::vector<std::string>& args) {
                                   ? static_cast<long long>(g.get("n")->num) : 0;
                 std::string st = g.get("status") ? g.get("status")->str : "?";
                 std::string note = g.get("note") ? g.get("note")->str : "";
+                std::string chronicle = g.get("chronicle") ? g.get("chronicle")->str : "";
+                std::string chronicler = g.get("chronicler") ? g.get("chronicler")->str : "";
                 std::cout << "gen " << n << "  [" << st << "]"
                           << (note.empty() ? "" : "  " + note) << "\n";
+                if (!chronicle.empty()) {
+                    std::string prev =
+                        chronicle.size() > 200 ? chronicle.substr(0, 200) + "…" : chronicle;
+                    std::cout << "      chronicle (by " << (chronicler.empty() ? "?" : chronicler)
+                              << "): " << prev << "\n";
+                }
             }
             return 0;
         }

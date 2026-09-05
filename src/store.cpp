@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -11,6 +12,8 @@
 #include "jsjson.h"
 #include "sha256.h"
 #include "util.h"
+
+#include "http.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -107,6 +110,7 @@ Task taskFromJson(const Json& j) {
     t.updatedTs = j.get("updatedTs") && j.get("updatedTs")->isNum()
                       ? static_cast<long long>(j.get("updatedTs")->num) : 0;
     t.gen = j.get("gen") && j.get("gen")->isNum() ? static_cast<int>(j.get("gen")->num) : 0;
+    t.human = j.get("human") && j.get("human")->isBool() && j.get("human")->b;
     return t;
 }
 
@@ -123,6 +127,7 @@ Json taskToJson(const Task& t) {
     j.set("createdTs", Json::number(static_cast<double>(t.createdTs)));
     j.set("updatedTs", Json::number(static_cast<double>(t.updatedTs)));
     j.set("gen", Json::number(static_cast<double>(t.gen)));
+    j.set("human", Json::boolean(t.human));
     return j;
 }
 
@@ -147,6 +152,9 @@ Society societyFromJson(const Json& j) {
         s.goal.achiever = jsonStr(*g, "achiever");
         s.goal.evidence = jsonStr(*g, "evidence");
         s.goal.verifier = jsonStr(*g, "verifier");
+        s.goal.oracle = jsonStr(*g, "oracle");
+        s.goal.oracleRead = jsonStr(*g, "oracleRead");
+        s.goal.oracleReadTs = jsonNum(*g, "oracleReadTs");
         s.goal.createdTs = jsonNum(*g, "createdTs");
         s.goal.closedTs = jsonNum(*g, "closedTs");
     }
@@ -158,6 +166,9 @@ Society societyFromJson(const Json& j) {
             g.bornTs = jsonNum(gj, "bornTs");
             g.retiredTs = jsonNum(gj, "retiredTs");
             g.note = jsonStr(gj, "note");
+            g.chronicle = jsonStr(gj, "chronicle");
+            g.chronicler = jsonStr(gj, "chronicler");
+            g.chronicleTs = jsonNum(gj, "chronicleTs");
             s.gens.push_back(g);
         }
     }
@@ -183,6 +194,9 @@ Json goalToJson(const Goal& g) {
     j.set("achiever", Json::string(g.achiever));
     j.set("evidence", Json::string(g.evidence));
     j.set("verifier", Json::string(g.verifier));
+    j.set("oracle", Json::string(g.oracle));
+    j.set("oracleRead", Json::string(g.oracleRead));
+    j.set("oracleReadTs", Json::number(static_cast<double>(g.oracleReadTs)));
     j.set("createdTs", Json::number(static_cast<double>(g.createdTs)));
     j.set("closedTs", Json::number(static_cast<double>(g.closedTs)));
     return j;
@@ -199,6 +213,9 @@ Json societyToJson(const Society& s) {
         gj.set("bornTs", Json::number(static_cast<double>(g.bornTs)));
         gj.set("retiredTs", Json::number(static_cast<double>(g.retiredTs)));
         gj.set("note", Json::string(g.note));
+        gj.set("chronicle", Json::string(g.chronicle));
+        gj.set("chronicler", Json::string(g.chronicler));
+        gj.set("chronicleTs", Json::number(static_cast<double>(g.chronicleTs)));
         gens.push(std::move(gj));
     }
     obj.set("generations", std::move(gens));
@@ -230,7 +247,100 @@ std::string joinScope(const std::vector<std::string>& scope) {
     return out;
 }
 
+bool isAsciiAlnum(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+// Cheap credential heuristics. Goals are public, hash-chained forever and
+// quoted into every generation's genesis briefing, so obvious credentials
+// are refused at the door.
+bool looksLikeCredential(const std::string& s) {
+    std::string low = asciiLower(s);
+    static const char* pairs[] = {"password:", "password=", "passwd=", "pwd=",
+                                  "token=", "secret=", "apikey=", "api_key=",
+                                  nullptr};
+    for (int i = 0; pairs[i]; i++)
+        if (low.find(pairs[i]) != std::string::npos) return true;
+    // "密码"/"口令" followed by an ASCII alnum (possibly after :：= or spaces)
+    static const char* cn[] = {"密码", "口令", nullptr};
+    for (int i = 0; cn[i]; i++) {
+        size_t pos = s.find(cn[i]);
+        while (pos != std::string::npos) {
+            size_t j = pos + std::strlen(cn[i]);
+            while (j < s.size() && (s[j] == ' ' || s[j] == ':' || s[j] == '=' ||
+                                    static_cast<unsigned char>(s[j]) == 0xA3 /*：*/))
+                j++;
+            if (j < s.size() && isAsciiAlnum(s[j])) return true;
+            pos = s.find(cn[i], pos + 1);
+        }
+    }
+    // Bank-card-shaped run of 16–19 consecutive digits.
+    int run = 0;
+    for (char c : s) {
+        run = (c >= '0' && c <= '9') ? run + 1 : 0;
+        if (run >= 16 && run <= 19) return true;
+        if (run > 19) return false;
+    }
+    return false;
+}
+
 }  // namespace
+
+OracleReading readOracle(const std::string& url) {
+    OracleReading out;
+    const std::string prefix = "http://";
+    if (url.compare(0, prefix.size(), prefix) != 0) {
+        out.err = "oracle must be an http:// URL";
+        return out;
+    }
+    std::string rest = url.substr(prefix.size());
+    if (rest.size() > 512) {
+        out.err = "oracle URL too long (max 512)";
+        return out;
+    }
+    size_t slash = rest.find('/');
+    std::string hostport = (slash == std::string::npos) ? rest : rest.substr(0, slash);
+    std::string target = (slash == std::string::npos) ? "/" : rest.substr(slash);
+    if (hostport.empty()) {
+        out.err = "oracle URL has no host";
+        return out;
+    }
+    std::string host = hostport;
+    int port = 80;
+    size_t colon = hostport.rfind(':');
+    if (colon != std::string::npos) {
+        host = hostport.substr(0, colon);
+        try {
+            port = std::stoi(hostport.substr(colon + 1));
+        } catch (...) {
+            out.err = "oracle URL has a bad port";
+            return out;
+        }
+    }
+    if (host.empty() || port <= 0 || port > 65535) {
+        out.err = "oracle URL has a bad host/port";
+        return out;
+    }
+    ClientResult r = httpClient(host, port, "GET", target, "", "", 5000);
+    if (!r.ok) {
+        out.err = "oracle fetch failed: " + (r.err.empty() ? r.body : r.err);
+        return out;
+    }
+    out.raw = r.body.size() > 2048 ? r.body.substr(0, 2048) : r.body;
+    Json j;
+    if (!Json::parse(r.body, j) || !j.isObj()) {
+        out.err = "oracle response is not a JSON object";
+        return out;
+    }
+    const Json* sat = j.get("satisfied");
+    if (!sat || !sat->isBool()) {
+        out.err = "oracle response lacks a boolean 'satisfied' field";
+        return out;
+    }
+    out.fetched = true;
+    out.satisfied = sat->b;
+    return out;
+}
 
 std::string messageHash(const std::string& prev, const std::string& room,
                         const Message& m) {
@@ -420,7 +530,8 @@ Task* RoomStore::findTask(RoomData& rd, long long id) {
 }
 
 Task RoomStore::createTaskLocked(const std::string& room, RoomData& rd, const std::string& title,
-                                 const std::string& detail, const std::string& creator, int gen) {
+                                 const std::string& detail, const std::string& creator, int gen,
+                                 bool human) {
     Task t;
     t.id = rd.nextTaskId++;
     t.title = title;
@@ -428,24 +539,27 @@ Task RoomStore::createTaskLocked(const std::string& room, RoomData& rd, const st
     t.status = "open";
     t.creator = creator;
     t.gen = gen;
+    t.human = human;
     t.createdTs = nowMs();
     t.updatedTs = t.createdTs;
     rd.tasks.push_back(t);
     persistTasks(room, rd);
     sayLocked(room, "server", "task",
-              "task #" + std::to_string(t.id) + " \"" + title + "\" created by " + creator,
+              "task #" + std::to_string(t.id) + " \"" + title + "\" created by " + creator +
+                  (human ? " — awaits human sign-off" : ""),
               -1);
     return t;
 }
 
 Task RoomStore::taskCreate(const std::string& room, const std::string& title,
-                           const std::string& detail, const std::string& creator) {
+                           const std::string& detail, const std::string& creator,
+                           bool human) {
     std::lock_guard<std::mutex> lock(mu_);
     if (title.empty() || title.size() > 512) throw std::runtime_error("bad task title");
     if (detail.size() > 4096) throw std::runtime_error("detail too long (max 4096)");
     if (creator.empty() || creator.size() > 64) throw std::runtime_error("bad agent name");
     RoomData& rd = load(room);
-    return createTaskLocked(room, rd, title, detail, creator, currentGenLocked(rd));
+    return createTaskLocked(room, rd, title, detail, creator, currentGenLocked(rd), human);
 }
 
 std::vector<Task> RoomStore::tasks(const std::string& room) {
@@ -509,12 +623,20 @@ Task RoomStore::taskVerify(const std::string& room, long long id, const std::str
     if (agent == t->assignee)
         throw std::runtime_error("task #" + std::to_string(id) +
                                   " cannot be verified by its own assignee — evidence gate");
-    // The division-of-labor gate: once roles are registered, only the
-    // reviewer and tester roles may verify.
-    if (!rd.soc.roles.empty() && !hasVerifyRoleLocked(rd, agent))
+    if (t->human) {
+        // Sovereign sign-off: a human-gate task may only be verified by the
+        // human it awaits — no agent role substitutes for the sovereign.
+        if (agent != "human")
+            throw std::runtime_error("task #" + std::to_string(id) +
+                                      " awaits human sign-off — only the agent 'human' may verify "
+                                      "it");
+    } else if (!rd.soc.roles.empty() && agent != "human" && !hasVerifyRoleLocked(rd, agent)) {
+        // The division-of-labor gate: once roles are registered, only the
+        // reviewer and tester roles may verify (the sovereign 'human' excepted).
         throw std::runtime_error("task #" + std::to_string(id) +
                                   " verification requires the reviewer or tester role while "
                                   "roles are registered");
+    }
     t->verifier = agent;
     t->updatedTs = nowMs();
     if (accept) {
@@ -778,13 +900,40 @@ void RoomStore::birthGenLocked(const std::string& room, RoomData& rd) {
     rd.soc.gens.push_back(g);
     persistSociety(room, rd);
     // The genesis task: the new generation's ritual entry point. It keeps
-    // every generation's board non-empty, so birth can never loop.
+    // every generation's board non-empty, so birth can never loop. From gen 2
+    // on, with chronicles available, the entry point is the distilled record
+    // — not a re-read of the whole history (context is the scarce resource).
+    bool anyChronicle = false;
+    for (const Generation& p : rd.soc.gens)
+        if (!p.chronicle.empty()) anyChronicle = true;
+    // The generation that just retired (gen n-1) carries the freshest
+    // distillation; its absence means recent work is only in raw history.
+    bool prevHasChronicle = n > 1 && !rd.soc.gens[n - 2].chronicle.empty();
+    std::string detail;
+    if (n > 1 && prevHasChronicle) {
+        detail = "The god goal is still open. Start from the chronicles of past "
+                 "generations (`greenroom gen <room>`) — the distilled record of what "
+                 "was tried, what worked and what remains; do NOT re-read the full "
+                 "history (use `greenroom search` for cold storage). Assess the gap, "
+                 "then create and distribute this generation's tasks.";
+    } else if (n > 1 && anyChronicle) {
+        detail = "The god goal is still open. The previous generation left no "
+                 "chronicle — read the chronicles of older generations (`greenroom "
+                 "gen <room>`) and the recent history since they were written "
+                 "(listen --since 0), assess the gap, then create and distribute "
+                 "this generation's tasks.";
+    } else if (n > 1) {
+        detail = "The god goal is still open. Past generations left no chronicle — "
+                 "read the full room history (listen --since 0), assess the gap, "
+                 "then create and distribute this generation's tasks.";
+    } else {
+        detail = "The god goal is still open. Read the full room history "
+                 "(listen --since 0), assess the gap, then create and "
+                 "distribute this generation's tasks.";
+    }
     createTaskLocked(room, rd,
                      "Generation " + std::to_string(n) + ": assess and plan",
-                     "The god goal is still open. Read the full room history "
-                     "(listen --since 0), assess the gap, then create and "
-                     "distribute this generation's tasks.",
-                     "server", n);
+                     detail, "server", n, false);
     sayLocked(room, "server", "gen",
               "generation " + std::to_string(n) + " born — the god goal is still open", -1);
 }
@@ -795,16 +944,29 @@ void RoomStore::checkGenDrainLocked(const std::string& room, RoomData& rd) {
     int cur = rd.soc.gens.back().n;
     for (const Task& t : rd.tasks)
         if (t.gen == cur && t.status != "done") return;  // work remains
-    retireGenLocked(room, rd, "task board drained");
+    const Generation& g = rd.soc.gens.back();
+    retireGenLocked(room, rd,
+                    g.chronicle.empty() ? "task board drained (no chronicle submitted)"
+                                       : "task board drained");
     birthGenLocked(room, rd);
 }
 
 void RoomStore::goalSet(const std::string& room, const std::string& text,
-                        const std::string& criteria, const std::string& agent) {
+                        const std::string& criteria, const std::string& oracle,
+                        const std::string& agent) {
     std::lock_guard<std::mutex> lock(mu_);
     if (text.empty() || text.size() > 2048) throw std::runtime_error("bad goal text (1..2048)");
     if (criteria.size() > 2048) throw std::runtime_error("criteria too long (max 2048)");
+    if (oracle.size() > 512) throw std::runtime_error("oracle URL too long (max 512)");
     if (agent.empty() || agent.size() > 64) throw std::runtime_error("bad agent name");
+    // Goals are public and hash-chained forever — refuse obvious credentials
+    // and oracle URLs that carry them in the query string.
+    if (looksLikeCredential(text + "\n" + criteria + "\n" + oracle))
+        throw std::runtime_error("goal looks like it contains credentials — goals are public "
+                                 "and hash-chained forever; keep credentials inside the oracle "
+                                 "service");
+    if (!oracle.empty() && oracle.compare(0, 7, "http://") != 0)
+        throw std::runtime_error("oracle must be an http:// URL");
     RoomData& rd = load(room);
     if (rd.soc.goal.exists &&
         (rd.soc.goal.status == "open" || rd.soc.goal.status == "proposed"))
@@ -814,6 +976,7 @@ void RoomStore::goalSet(const std::string& room, const std::string& text,
     rd.soc.goal.exists = true;
     rd.soc.goal.text = text;
     rd.soc.goal.criteria = criteria;
+    rd.soc.goal.oracle = oracle;
     rd.soc.goal.status = "open";
     rd.soc.goal.proposer = agent;
     rd.soc.goal.createdTs = nowMs();
@@ -824,6 +987,7 @@ void RoomStore::goalSet(const std::string& room, const std::string& text,
     sayLocked(room, "server", "goal",
               "god goal declared by " + agent + ": \"" + text + "\"" +
                   (criteria.empty() ? "" : " (criteria: " + criteria + ")") +
+                  (oracle.empty() ? "" : " (oracle: " + oracle + ")") +
                   " — society born",
               -1);
     birthGenLocked(room, rd);
@@ -848,7 +1012,8 @@ void RoomStore::goalAchieve(const std::string& room, const std::string& agent,
               agent + " proposed god-goal achievement: " + ev, -1);
 }
 
-void RoomStore::goalVerify(const std::string& room, const std::string& agent, bool accept) {
+void RoomStore::goalVerify(const std::string& room, const std::string& agent, bool accept,
+                           const OracleReading* oracle) {
     std::lock_guard<std::mutex> lock(mu_);
     if (agent.empty() || agent.size() > 64) throw std::runtime_error("bad agent name");
     RoomData& rd = load(room);
@@ -858,11 +1023,28 @@ void RoomStore::goalVerify(const std::string& room, const std::string& agent, bo
     if (agent == rd.soc.goal.achiever)
         throw std::runtime_error("the god goal cannot be verified by its own achiever — "
                                  "evidence gate");
-    if (!rd.soc.roles.empty() && !hasVerifyRoleLocked(rd, agent))
+    // The sovereign 'human' passes the division-of-labor gate unconditionally.
+    if (!rd.soc.roles.empty() && agent != "human" && !hasVerifyRoleLocked(rd, agent))
         throw std::runtime_error("god-goal verification requires the reviewer or tester role "
                                  "while roles are registered");
     Goal& g = rd.soc.goal;
     if (accept) {
+        // The oracle gate: with an oracle declared, the society cannot close
+        // unless the external predicate says satisfied. The verifier is a
+        // trigger, not a judge.
+        if (!g.oracle.empty()) {
+            if (!oracle || !oracle->fetched)
+                throw std::runtime_error(
+                    "oracle unreadable: " +
+                    (oracle && !oracle->err.empty() ? oracle->err : "no reading supplied") +
+                    " — the god goal cannot be closed without the oracle");
+            if (!oracle->satisfied)
+                throw std::runtime_error("oracle says NOT satisfied — the god goal cannot be "
+                                         "closed (reading: " +
+                                         oracle->raw + ")");
+            g.oracleRead = oracle->raw;
+            g.oracleReadTs = nowMs();
+        }
         g.status = "achieved";
         g.verifier = agent;
         g.closedTs = nowMs();
@@ -919,6 +1101,27 @@ void RoomStore::genAdvance(const std::string& room, const std::string& agent,
         throw std::runtime_error("no active generation");
     retireGenLocked(room, rd, "forced by " + agent + (note.empty() ? "" : ": " + note));
     birthGenLocked(room, rd);
+}
+
+void RoomStore::genChronicle(const std::string& room, const std::string& agent,
+                              const std::string& text) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (agent.empty() || agent.size() > 64) throw std::runtime_error("bad agent name");
+    if (text.empty() || text.size() > 4096)
+        throw std::runtime_error("bad chronicle text (1..4096) — the fixed budget is the "
+                                 "distillation discipline");
+    RoomData& rd = load(room);
+    if (rd.soc.gens.empty() || rd.soc.gens.back().status != "active")
+        throw std::runtime_error("no active generation to chronicle");
+    Generation& g = rd.soc.gens.back();
+    g.chronicle = text;
+    g.chronicler = agent;
+    g.chronicleTs = nowMs();
+    persistSociety(room, rd);
+    std::string ev = text.size() > 120 ? text.substr(0, 120) + "…" : text;
+    sayLocked(room, "server", "gen",
+              "generation " + std::to_string(g.n) + " chronicle updated by " + agent + ": " + ev,
+              -1);
 }
 
 void RoomStore::roleTake(const std::string& room, const std::string& agent,
