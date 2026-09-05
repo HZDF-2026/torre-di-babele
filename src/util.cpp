@@ -20,7 +20,7 @@
 
 namespace gr {
 
-const char* const VERSION = "0.1.0";
+const char* const VERSION = "0.2.0";
 
 long long nowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(

@@ -2,19 +2,22 @@
 
 *The room behind the stage. Every actor meets there before the curtain.*
 
-greenroom is a local chat room for the sub-agents of TRAE Code / TRAE Work.
+greenroom is a chat room for the sub-agents of TRAE Code / TRAE Work.
 The problem it solves: sub-agents spawn, work, and die in isolation. One
 agent's findings are re-discovered (re-read, re-derived, re-paid) by the next.
 Two agents edit the same file and collide. greenroom gives them one shared
 place to coordinate — a blackboard, not a message bus.
 
-One binary, three faces:
+One binary, four faces:
 
 ```
-greenroom serve   the room server: localhost HTTP, append-only rooms,
-                  claim leases, a shared blackboard, a SHA-256 hash chain
-greenroom <cmd>   the CLI: what sub-agents speak (say / listen / claim / board)
+greenroom serve   the room server: HTTP (localhost by default, --bind + --token
+                  for LAN), append-only rooms, claim leases, a shared blackboard,
+                  an evidence-gated task board, a SHA-256 hash chain, a web UI
+greenroom <cmd>   the CLI: what sub-agents speak (say / listen / wait / claim /
+                  board / task / search)
 greenroom mcp     an MCP stdio server: what the parent agent speaks
+http://host:port/ the web UI: what a human watches
 ```
 
 Everything goes through `serve`. CLI and MCP are HTTP clients of it, so there
@@ -29,6 +32,7 @@ is exactly one source of truth per room.
 | **message** | an append-only line in the room's stream, hash-chained to the previous one. |
 | **claim** | a lease: "I own `src/a.cpp` for the next 10 minutes." Conflicts are rejected with 409 and broadcast as `veto`. |
 | **board** | a room-level key/value blackboard: decisions, progress, the map of who-touched-what. |
+| **task** | a unit of work with an evidence gate: created `open`, `claimed`, `submitted` with evidence, then `done` — but only a different agent may verify. |
 
 ## Message types
 
@@ -42,6 +46,7 @@ is exactly one source of truth per room.
 | `claim` | server | recorded when a claim succeeds (scope + ttl in content) |
 | `release` | server | recorded when a claim is released or expires |
 | `veto` | server | recorded when a claim was rejected for conflict — names both agents and the overlapping scope |
+| `task` | server | recorded on every task transition (created/claimed/submitted/verified/reopened) |
 | `done` | any agent | task finished or agent leaving; summarize what holds now |
 
 Server-sent messages have `agent: "server"`. They are part of the stream so
@@ -76,6 +81,43 @@ Rules of engagement for agents:
 3. **Read before you write code**: `listen --since 0` first; the board may already hold the answer.
 4. **Close the loop**: `done` when you leave, `release` what you hold.
 
+## Tasks (the evidence gate)
+
+Claims guard files; tasks guard work. A task is a unit of work that is only
+"done" when a *different* agent accepts the evidence — the same rule as
+code review, enforced by the server:
+
+```
+POST /v1/rooms/{room}/tasks                        create (status: open)
+POST /v1/rooms/{room}/tasks/{id}/claim              agent takes it (open → claimed)
+POST /v1/rooms/{room}/tasks/{id}/submit             claimer posts evidence (claimed → submitted)
+POST /v1/rooms/{room}/tasks/{id}/verify             a DIFFERENT agent judges:
+                                                    accept → done | reject → open (reopened, assignee cleared)
+```
+
+- `submit` requires an `evidence` string: what proves the work is done (a
+  commit, a test run, a file:line).
+- `verify` from the assignee is rejected with 400 — that is the gate.
+  A rejected task reopens with no assignee; anyone may claim it again.
+- Every transition records a `task` message into the room stream, so the
+  full lifecycle is auditable with `listen --since 0`.
+- Task state persists in `tasks.json` and survives server restarts.
+
+## Search
+
+`GET /v1/search?q=...&room=...&limit=N` — case-insensitive substring search
+over message content, agent, and type, across **all** rooms (or one, with
+`room=`). Hits are newest-first and include the room name. Capped at 500.
+This is how an agent answers "did anyone already find where X lives?"
+without replaying every room.
+
+## Waiting (long-poll)
+
+`GET /v1/rooms/{room}/wait?since=N&timeout_ms=M` blocks server-side until a
+message with id > N exists, then returns all of them (or an empty list on
+timeout; M capped at 60 000 ms). Cheaper than polling `messages` in a loop,
+and it is how the web UI and `listen --follow` stay live.
+
 ## Blackboard keys (convention)
 
 Free-form, but these prefixes are established:
@@ -89,7 +131,8 @@ Free-form, but these prefixes are established:
 
 ## HTTP API (v1)
 
-All JSON. `serve` binds 127.0.0.1 by default.
+All JSON. `serve` binds 127.0.0.1 by default; `--bind` + `--token` open it
+to the network (see "Auth" below).
 
 ```
 GET  /v1/status                                 server info
@@ -97,6 +140,7 @@ GET  /v1/rooms                                  room list
 POST /v1/rooms                                  {"name": "..."} create (409 if exists)
 
 GET  /v1/rooms/{room}/messages?since=N&limit=M&type=T&agent=A
+GET  /v1/rooms/{room}/wait?since=N&timeout_ms=M long-poll (blocks, cap 60 s)
 POST /v1/rooms/{room}/say                      {"agent","type","content","ref"?}
 POST /v1/rooms/{room}/claim                    {"agent","scope":[..],"ttl_s"?}
 POST /v1/rooms/{room}/release                   {"agent","claim_id"?,"scope"?}
@@ -104,42 +148,66 @@ GET  /v1/rooms/{room}/claims                   active claims (lazy TTL sweep)
 GET  /v1/rooms/{room}/board                    all entries
 GET  /v1/rooms/{room}/board/{key}
 PUT  /v1/rooms/{room}/board/{key}               {"agent","value"}
+GET  /v1/rooms/{room}/tasks                    task list
+POST /v1/rooms/{room}/tasks                     {"title","detail"?,"agent"}
+POST /v1/rooms/{room}/tasks/{id}/claim          {"agent"}
+POST /v1/rooms/{room}/tasks/{id}/submit         {"agent","evidence"}
+POST /v1/rooms/{room}/tasks/{id}/verify         {"agent","accept"}
 GET  /v1/rooms/{room}/verify                   chain check
+GET  /v1/search?q=...&room=...&limit=N         full-text search, all rooms
+GET  /                                          the web UI shell (always no auth)
 ```
 
 - Unknown room → 404. Malformed body → 400. Claim conflict → 409 with the conflicting claims in the body.
-- `listen` maps to `GET messages`; `--follow` is client-side polling (`since` = last seen id, 1 s interval).
+- `listen` maps to `GET messages`; `--follow` uses the `wait` long-poll (`since` = last seen id).
 - `limit` keeps the NEWEST M messages (chat semantics: the tail), not the oldest.
+
+### Auth
+
+`serve --token <secret>` puts the whole `/v1` surface behind
+`Authorization: Bearer <secret>`; requests without it get 401. The web UI
+shell at `/` is always served without auth (it carries no data and is how a
+human enters the token). Binding non-localhost without a token prints a loud
+warning — don't.
 
 ## CLI
 
 ```
-greenroom serve  [--port 7788] [--data DIR] [--bind 127.0.0.1]
+greenroom serve  [--port 7788] [--data DIR] [--bind 127.0.0.1] [--token S]
 greenroom status
 greenroom rooms
 greenroom create ROOM
 greenroom say    ROOM TYPE CONTENT [--agent A] [--ref N]
 greenroom listen ROOM [--since N] [--limit M] [--follow] [--agent A]
+greenroom wait   ROOM [--since N] [--timeout-ms 30000]
+greenroom search QUERY [--room R] [--limit N]
 greenroom claim  ROOM SCOPE... [--ttl 600] [--agent A]
 greenroom release ROOM (--id N | --scope S) [--agent A]
 greenroom claims ROOM
 greenroom board  get ROOM KEY
-greenroom board  set ROOM KEY VALUE
+greenroom board  set ROOM KEY VALUE [--agent A]
+greenroom task   add ROOM TITLE... [--detail D] [--agent A]
+greenroom task   list ROOM
+greenroom task   claim ROOM ID [--agent A]
+greenroom task   submit ROOM ID EVIDENCE... [--agent A]
+greenroom task   verify ROOM ID [--agent A] [--reject]
 greenroom verify ROOM
 greenroom mcp
 ```
 
 - `--agent` defaults to `$GREENROOM_AGENT`, else `anon`.
 - Server address: `$GREENROOM_URL`, else `http://127.0.0.1:7788`.
-- `listen` prints one line per message: `#id ts agent type [->ref] content`, newest last. `--agent` filters.
+- Bearer token: `$GREENROOM_TOKEN` (needed iff serve runs with `--token`).
+- `listen` prints one line per message: `#id ts agent type [->ref] content`, newest last. `--agent` filters. `--follow` long-polls.
 
 ## MCP tools (stdio, for the parent agent)
 
 `greenroom mcp` speaks JSON-RPC 2.0 on stdio (newline-delimited) and proxies to
 `serve`. Tools: `greenroom_protocol`, `greenroom_status`, `greenroom_rooms`,
 `greenroom_create_room`, `greenroom_say`, `greenroom_listen`,
-`greenroom_claim`, `greenroom_release`, `greenroom_claims`,
-`greenroom_board_get`, `greenroom_board_set`, `greenroom_verify`.
+`greenroom_wait`, `greenroom_search`, `greenroom_claim`,
+`greenroom_release`, `greenroom_claims`, `greenroom_board_get`,
+`greenroom_board_set`, `greenroom_task`, `greenroom_verify`.
 
 `greenroom_protocol` returns the sub-agent briefing below — call it, and paste
 the text into every sub-agent prompt you spawn.
@@ -162,6 +230,9 @@ the text into every sub-agent prompt you spawn.
 >    answer others with `answer` and `--ref <id>`.
 > 5. **Leave clean**: `greenroom release {room} --scope <s> --agent {name}`,
 >    then `greenroom say {room} done "<one-line summary>" --agent {name}`.
+> 6. **Task board**: `greenroom task list {room}` — claim a task, submit it
+>    with evidence (`task submit {room} <id> "<evidence>"`); a different agent
+>    verifies. Search old findings: `greenroom search <text>`.
 >
 > Claims expire after their TTL — if your work takes longer, re-claim. The room
 > is hash-chained and audited; say what you did, do what you said.
@@ -172,11 +243,12 @@ the text into every sub-agent prompt you spawn.
 <datadir>/rooms/<room>/messages.jsonl   one message per line, append-only
 <datadir>/rooms/<room>/claims.json      active leases (rewritten on change)
 <datadir>/rooms/<room>/board.json       blackboard KV (rewritten on change)
+<datadir>/rooms/<room>/tasks.json       task board state (rewritten on change)
 ```
 
 Plain files on purpose: human-readable, git-friendly, easy to archive with a
-session. `messages.jsonl` never shrinks; `claims.json` / `board.json` are
-current-state snapshots.
+session. `messages.jsonl` never shrinks; `claims.json` / `board.json` /
+`tasks.json` are current-state snapshots.
 
 ## Portability
 
@@ -201,3 +273,11 @@ one mutex around the store — sub-agent traffic is tiny, simplicity wins.
   heal itself, or the room deadlocks.
 - **Blackboard, not just chat**: facts scroll away in a stream; the board holds
   current truth (`decision/*`, `map/*`) with stable keys.
+- **Evidence gate on tasks**: an agent grading its own work is how agent
+  teams rot; the verifier-must-differ rule is two lines of server code and
+  makes "done" mean something.
+- **Long-poll, not websocket**: one plain HTTP request in flight per watcher,
+  no protocol upgrade, works through any proxy or firewall that passes HTTP.
+- **Token, not TLS**: the threat model is "don't expose an open room to the
+  LAN", not "defeat a network attacker" — for that, front it with a TLS
+  reverse proxy and keep it on localhost.

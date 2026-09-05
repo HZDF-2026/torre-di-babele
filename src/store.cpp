@@ -2,6 +2,7 @@
 #include "store.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <stdexcept>
 #include <sys/stat.h>
@@ -91,6 +92,45 @@ bool scopeIntersects(const std::vector<std::string>& a, const std::vector<std::s
     return false;
 }
 
+Task taskFromJson(const Json& j) {
+    Task t;
+    t.id = j.get("id") && j.get("id")->isNum() ? static_cast<long long>(j.get("id")->num) : 0;
+    if (j.get("title")) t.title = j.get("title")->str;
+    if (j.get("detail")) t.detail = j.get("detail")->str;
+    if (j.get("status")) t.status = j.get("status")->str;
+    if (j.get("creator")) t.creator = j.get("creator")->str;
+    if (j.get("assignee")) t.assignee = j.get("assignee")->str;
+    if (j.get("evidence")) t.evidence = j.get("evidence")->str;
+    if (j.get("verifier")) t.verifier = j.get("verifier")->str;
+    t.createdTs = j.get("createdTs") && j.get("createdTs")->isNum()
+                      ? static_cast<long long>(j.get("createdTs")->num) : 0;
+    t.updatedTs = j.get("updatedTs") && j.get("updatedTs")->isNum()
+                      ? static_cast<long long>(j.get("updatedTs")->num) : 0;
+    return t;
+}
+
+Json taskToJson(const Task& t) {
+    Json j = Json::object();
+    j.set("id", Json::number(static_cast<double>(t.id)));
+    j.set("title", Json::string(t.title));
+    j.set("detail", Json::string(t.detail));
+    j.set("status", Json::string(t.status));
+    j.set("creator", Json::string(t.creator));
+    j.set("assignee", Json::string(t.assignee));
+    j.set("evidence", Json::string(t.evidence));
+    j.set("verifier", Json::string(t.verifier));
+    j.set("createdTs", Json::number(static_cast<double>(t.createdTs)));
+    j.set("updatedTs", Json::number(static_cast<double>(t.updatedTs)));
+    return j;
+}
+
+std::string asciiLower(const std::string& s) {
+    std::string out = s;
+    for (char& c : out)
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    return out;
+}
+
 std::string joinScope(const std::vector<std::string>& scope) {
     std::string out;
     for (size_t i = 0; i < scope.size(); i++) {
@@ -154,9 +194,19 @@ RoomStore::RoomData& RoomStore::load(const std::string& room) {
             }
         }
     }
+    std::string tf = pathJoin(roomDir(room), "tasks.json");
+    if (fileExists(tf)) {
+        Json j;
+        if (Json::parse(readBytes(tf), j) && j.isArr()) {
+            for (const Json& t : j.arr) rd.tasks.push_back(taskFromJson(t));
+        }
+    }
     long long maxClaimId = 0;
     for (const Claim& c : rd.claims) maxClaimId = std::max(maxClaimId, c.id);
     rd.nextClaimId = maxClaimId + 1;
+    long long maxTaskId = 0;
+    for (const Task& t : rd.tasks) maxTaskId = std::max(maxTaskId, t.id);
+    rd.nextTaskId = maxTaskId + 1;
     return cache_.emplace(room, std::move(rd)).first->second;
 }
 
@@ -186,7 +236,7 @@ Message RoomStore::sayLocked(const std::string& room, const std::string& agent,
                              const std::string& type, const std::string& content,
                              long long ref) {
     static const char* types[] = {"say", "plan", "fact", "ask", "answer",
-                                  "claim", "release", "veto", "done", nullptr};
+                                  "claim", "release", "veto", "done", "task", nullptr};
     bool okType = false;
     for (int i = 0; types[i]; i++)
         if (type == types[i]) okType = true;
@@ -207,6 +257,7 @@ Message RoomStore::sayLocked(const std::string& room, const std::string& agent,
     m.hash = messageHash(m.prev, room, m);
     rd.msgs.push_back(m);
     appendBytes(pathJoin(roomDir(room), "messages.jsonl"), msgToJson(m).dump() + "\n");
+    cv_.notify_all();
     return m;
 }
 
@@ -225,6 +276,163 @@ std::vector<Message> RoomStore::messages(const std::string& room, long long sinc
     if (limit > 0 && static_cast<int>(out.size()) > limit)
         out.assign(out.end() - limit, out.end());
     return out;
+}
+
+std::vector<Message> RoomStore::waitMessages(const std::string& room, long long since,
+                                             long long timeoutMs) {
+    if (timeoutMs < 0) timeoutMs = 0;
+    if (timeoutMs > 60000) timeoutMs = 60000;
+    std::unique_lock<std::mutex> lock(mu_);
+    RoomData& rd = load(room);
+    cv_.wait_for(lock, std::chrono::milliseconds(timeoutMs), [&rd, since] {
+        return !rd.msgs.empty() && rd.msgs.back().id > since;
+    });
+    std::vector<Message> out;
+    for (const Message& m : rd.msgs)
+        if (m.id > since) out.push_back(m);
+    return out;
+}
+
+std::vector<SearchHit> RoomStore::search(const std::string& query,
+                                         const std::string& roomFilter, int limit) {
+    if (limit <= 0) limit = 50;
+    if (limit > 500) limit = 500;
+    std::string needle = asciiLower(query);
+    if (needle.empty()) return {};
+    std::lock_guard<std::mutex> lock(mu_);
+    std::vector<SearchHit> out;
+    for (const std::string& room : rooms()) {
+        if (!roomFilter.empty() && room != roomFilter) continue;
+        RoomData& rd = load(room);
+        for (auto it = rd.msgs.rbegin(); it != rd.msgs.rend(); ++it) {
+            std::string hay = asciiLower(it->content + "\n" + it->agent + "\n" + it->type);
+            if (hay.find(needle) == std::string::npos) continue;
+            SearchHit h;
+            h.room = room;
+            h.msg = *it;
+            out.push_back(h);
+            if (static_cast<int>(out.size()) >= limit) return out;
+        }
+    }
+    return out;
+}
+
+Task* RoomStore::findTask(RoomData& rd, long long id) {
+    for (Task& t : rd.tasks)
+        if (t.id == id) return &t;
+    return nullptr;
+}
+
+Task RoomStore::taskCreate(const std::string& room, const std::string& title,
+                           const std::string& detail, const std::string& creator) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (title.empty() || title.size() > 512) throw std::runtime_error("bad task title");
+    if (detail.size() > 4096) throw std::runtime_error("detail too long (max 4096)");
+    if (creator.empty() || creator.size() > 64) throw std::runtime_error("bad agent name");
+    RoomData& rd = load(room);
+    Task t;
+    t.id = rd.nextTaskId++;
+    t.title = title;
+    t.detail = detail;
+    t.status = "open";
+    t.creator = creator;
+    t.createdTs = nowMs();
+    t.updatedTs = t.createdTs;
+    rd.tasks.push_back(t);
+    persistTasks(room, rd);
+    sayLocked(room, "server", "task",
+              "task #" + std::to_string(t.id) + " \"" + title + "\" created by " + creator,
+              -1);
+    return t;
+}
+
+std::vector<Task> RoomStore::tasks(const std::string& room) {
+    std::lock_guard<std::mutex> lock(mu_);
+    RoomData& rd = load(room);
+    return rd.tasks;
+}
+
+Task RoomStore::taskClaim(const std::string& room, long long id, const std::string& agent) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (agent.empty() || agent.size() > 64) throw std::runtime_error("bad agent name");
+    RoomData& rd = load(room);
+    Task* t = findTask(rd, id);
+    if (!t) throw std::runtime_error("no such task: #" + std::to_string(id));
+    if (t->status != "open")
+        throw std::runtime_error("task #" + std::to_string(id) + " is not open (status: " +
+                                 t->status + ")");
+    t->status = "claimed";
+    t->assignee = agent;
+    t->updatedTs = nowMs();
+    persistTasks(room, rd);
+    sayLocked(room, "server", "task",
+              "task #" + std::to_string(id) + " \"" + t->title + "\" claimed by " + agent, -1);
+    return *t;
+}
+
+Task RoomStore::taskSubmit(const std::string& room, long long id, const std::string& agent,
+                           const std::string& evidence) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (evidence.empty()) throw std::runtime_error("evidence required to submit");
+    if (evidence.size() > 4096) throw std::runtime_error("evidence too long (max 4096)");
+    RoomData& rd = load(room);
+    Task* t = findTask(rd, id);
+    if (!t) throw std::runtime_error("no such task: #" + std::to_string(id));
+    if (t->status != "claimed")
+        throw std::runtime_error("task #" + std::to_string(id) + " is not claimed (status: " +
+                                 t->status + ")");
+    if (t->assignee != agent)
+        throw std::runtime_error("task #" + std::to_string(id) + " is assigned to " + t->assignee);
+    t->status = "submitted";
+    t->evidence = evidence;
+    t->updatedTs = nowMs();
+    persistTasks(room, rd);
+    std::string ev = evidence.size() > 200 ? evidence.substr(0, 200) + "…" : evidence;
+    sayLocked(room, "server", "task",
+              "task #" + std::to_string(id) + " submitted by " + agent + ": " + ev, -1);
+    return *t;
+}
+
+Task RoomStore::taskVerify(const std::string& room, long long id, const std::string& agent,
+                           bool accept) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (agent.empty() || agent.size() > 64) throw std::runtime_error("bad agent name");
+    RoomData& rd = load(room);
+    Task* t = findTask(rd, id);
+    if (!t) throw std::runtime_error("no such task: #" + std::to_string(id));
+    if (t->status != "submitted")
+        throw std::runtime_error("task #" + std::to_string(id) + " is not submitted (status: " +
+                                 t->status + ")");
+    // The evidence gate: the verifier must be a different agent than the submitter.
+    if (agent == t->assignee)
+        throw std::runtime_error("task #" + std::to_string(id) +
+                                  " cannot be verified by its own assignee — evidence gate");
+    t->verifier = agent;
+    t->updatedTs = nowMs();
+    if (accept) {
+        t->status = "done";
+        persistTasks(room, rd);
+        sayLocked(room, "server", "task",
+                  "task #" + std::to_string(id) + " \"" + t->title +
+                      "\" verified DONE by " + agent,
+                  -1);
+    } else {
+        t->status = "open";
+        t->assignee.clear();
+        t->evidence.clear();
+        persistTasks(room, rd);
+        sayLocked(room, "server", "task",
+                  "task #" + std::to_string(id) + " \"" + t->title + "\" rejected by " + agent +
+                      " — reopened",
+                  -1);
+    }
+    return *t;
+}
+
+void RoomStore::persistTasks(const std::string& room, RoomData& rd) {
+    Json arr = Json::array();
+    for (const Task& t : rd.tasks) arr.push(taskToJson(t));
+    writeBytes(pathJoin(roomDir(room), "tasks.json"), arr.dump() + "\n");
 }
 
 void RoomStore::sweepExpired(const std::string& room, RoomData& rd) {

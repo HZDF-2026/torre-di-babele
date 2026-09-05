@@ -20,22 +20,30 @@ void usage() {
     std::cerr << "greenroom " << VERSION << " — shared chat room for coding sub-agents\n"
               << "\n"
               << "usage:\n"
-              << "  greenroom serve  [--port 7788] [--data DIR] [--bind 127.0.0.1]\n"
+              << "  greenroom serve  [--port 7788] [--data DIR] [--bind 127.0.0.1] [--token S]\n"
               << "  greenroom status\n"
               << "  greenroom rooms\n"
               << "  greenroom create ROOM\n"
               << "  greenroom say    ROOM TYPE CONTENT [--agent A] [--ref N]\n"
               << "  greenroom listen ROOM [--since N] [--limit M] [--follow] [--agent A]\n"
+              << "  greenroom wait   ROOM [--since N] [--timeout-ms 30000]\n"
+              << "  greenroom search QUERY [--room R] [--limit N]\n"
               << "  greenroom claim  ROOM SCOPE... [--ttl 600] [--agent A]\n"
               << "  greenroom release ROOM (--id N | --scope S) [--agent A]\n"
               << "  greenroom claims ROOM\n"
               << "  greenroom board  get ROOM KEY\n"
               << "  greenroom board  set ROOM KEY VALUE [--agent A]\n"
+              << "  greenroom task add ROOM TITLE... [--detail D] [--agent A]\n"
+              << "  greenroom task list ROOM\n"
+              << "  greenroom task claim ROOM ID [--agent A]\n"
+              << "  greenroom task submit ROOM ID EVIDENCE... [--agent A]\n"
+              << "  greenroom task verify ROOM ID [--agent A] [--reject]\n"
               << "  greenroom verify ROOM\n"
               << "  greenroom mcp\n"
               << "\n"
-              << "types: say plan fact ask answer done\n"
+              << "types: say plan fact ask answer done task\n"
               << "env:   GREENROOM_URL (default http://127.0.0.1:7788)\n"
+              << "       GREENROOM_TOKEN (Bearer token when serve runs with --token)\n"
               << "       GREENROOM_AGENT (default --agent, else 'anon')\n"
               << "see PROTOCOL.md for the full protocol.\n";
 }
@@ -166,26 +174,33 @@ void printMsg(const Json& m) {
 }
 
 ClientResult httpGet(const Target& t, const std::string& target) {
-    return httpClient(t.host, t.port, "GET", target, "");
+    return httpClient(t.host, t.port, "GET", target, "", envOr("GREENROOM_TOKEN", ""));
 }
 
 ClientResult httpPost(const Target& t, const std::string& target, const std::string& body) {
-    return httpClient(t.host, t.port, "POST", target, body);
+    return httpClient(t.host, t.port, "POST", target, body, envOr("GREENROOM_TOKEN", ""));
 }
 
 ClientResult httpPut(const Target& t, const std::string& target, const std::string& body) {
-    return httpClient(t.host, t.port, "PUT", target, body);
+    return httpClient(t.host, t.port, "PUT", target, body, envOr("GREENROOM_TOKEN", ""));
 }
 
 int cmdServe(const Parsed& p) {
     int port = static_cast<int>(flagNum(p, "port", 7788));
     std::string data = flag(p, "data", defaultDataDir());
     std::string bind = flag(p, "bind", "127.0.0.1");
+    std::string token = flag(p, "token", envOr("GREENROOM_TOKEN", ""));
+    if ((bind != "127.0.0.1" && bind != "localhost" && bind != "::1") && token.empty()) {
+        std::cerr << "warning: binding " << bind << " WITHOUT a token — anyone on the network "
+                  << "can read/write every room. Pass --token <secret>.\n";
+    }
     RoomStore store(data);
     std::string err;
-    HttpServer srv(bind, port, makeApiRouter(store));
+    HttpServer srv(bind, port, makeApiRouter(store, token));
     std::cerr << "greenroom " << VERSION << " serving on http://" << bind << ":" << port
-              << "  (data: " << data << ")\n";
+              << "  (data: " << data << ")"
+              << (token.empty() ? "" : "  (auth: token required)") << "\n";
+    std::cerr << "web UI: http://" << bind << ":" << port << "/\n";
     if (!srv.run(err)) {
         std::cerr << "error: " << err << "\n";
         return 1;
@@ -224,8 +239,32 @@ int cmdListen(const Parsed& p) {
             if (id > since) since = id;
         }
         if (!follow) return 0;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        // Long-poll: block server-side until new messages, then loop.
+        ClientResult w = httpGet(t, "/v1/rooms/" + urlEnc(room) +
+                                       "/wait?since=" + std::to_string(since) +
+                                       "&timeout_ms=25000");
+        if (!w.ok) return fail(w);
     }
+}
+
+int cmdWait(const Parsed& p) {
+    if (p.pos.empty()) {
+        std::cerr << "error: wait needs ROOM\n";
+        return 1;
+    }
+    Target t = parseTarget();
+    std::string target = "/v1/rooms/" + urlEnc(p.pos[0]) +
+                         "/wait?since=" + std::to_string(flagNum(p, "since", 0)) +
+                         "&timeout_ms=" + std::to_string(flagNum(p, "timeout-ms", 30000));
+    ClientResult r = httpGet(t, target);
+    if (!r.ok) return fail(r);
+    Json body;
+    if (!Json::parse(r.body, body) || !body.isObj() || !body.get("messages")) {
+        std::cerr << "error: bad response\n";
+        return 1;
+    }
+    for (const Json& m : body.get("messages")->arr) printMsg(m);
+    return 0;
 }
 
 }  // namespace
@@ -246,8 +285,8 @@ int runCli(const std::vector<std::string>& args) {
     if (cmd == "mcp") return runMcp();
     {
         Parsed p;
-        if (!parseArgs(rest, p, {"port", "data", "bind", "agent", "ref", "since", "limit",
-                                 "ttl", "id", "scope"}))
+        if (!parseArgs(rest, p, {"port", "data", "bind", "token", "agent", "ref", "since",
+                                 "limit", "ttl", "id", "scope", "timeout-ms", "detail", "room"}))
             return 1;
         if (cmd == "serve") return cmdServe(p);
 
@@ -298,6 +337,123 @@ int runCli(const std::vector<std::string>& args) {
             return 0;
         }
         if (cmd == "listen") return cmdListen(p);
+        if (cmd == "wait") return cmdWait(p);
+        if (cmd == "search") {
+            if (p.pos.empty()) {
+                std::cerr << "error: search needs QUERY\n";
+                return 1;
+            }
+            std::string target = "/v1/search?q=" + urlEnc(p.pos[0]);
+            if (const std::string& rf = flag(p, "room"); !rf.empty())
+                target += "&room=" + urlEnc(rf);
+            long long lim = flagNum(p, "limit", 0);
+            if (lim > 0) target += "&limit=" + std::to_string(lim);
+            ClientResult r = httpGet(t, target);
+            if (!r.ok) return fail(r);
+            Json body;
+            if (Json::parse(r.body, body) && body.get("hits") && body.get("hits")->isArr()) {
+                for (const Json& m : body.get("hits")->arr) {
+                    std::string room = m.get("room") ? m.get("room")->str : "?";
+                    long long id = m.get("id") && m.get("id")->isNum()
+                                       ? static_cast<long long>(m.get("id")->num) : 0;
+                    std::string agent = m.get("agent") ? m.get("agent")->str : "?";
+                    std::string content = m.get("content") ? m.get("content")->str : "";
+                    std::cout << room << "  #" << id << "  " << agent << "  " << content << "\n";
+                }
+            }
+            return 0;
+        }
+        if (cmd == "task") {
+            if (p.pos.size() < 2) {
+                std::cerr << "error: task add|list|claim|submit|verify ...\n";
+                return 1;
+            }
+            std::string action = p.pos[0];
+            if (action == "add") {
+                if (p.pos.size() < 3) {
+                    std::cerr << "error: task add needs ROOM TITLE...\n";
+                    return 1;
+                }
+                Json body = Json::object();
+                std::string title;
+                for (size_t i = 2; i < p.pos.size(); i++)
+                    title += (title.empty() ? "" : " ") + p.pos[i];
+                body.set("title", Json::string(title));
+                body.set("detail", Json::string(flag(p, "detail")));
+                body.set("agent", Json::string(defaultAgent(p)));
+                ClientResult r = httpPost(t, "/v1/rooms/" + urlEnc(p.pos[1]) + "/tasks",
+                                          body.dump());
+                if (!r.ok) return fail(r);
+                std::cout << r.body << "\n";
+                return 0;
+            }
+            if (action == "list") {
+                ClientResult r = httpGet(t, "/v1/rooms/" + urlEnc(p.pos[1]) + "/tasks");
+                if (!r.ok) return fail(r);
+                Json body;
+                if (Json::parse(r.body, body) && body.get("tasks") &&
+                    body.get("tasks")->isArr()) {
+                    for (const Json& tk : body.get("tasks")->arr) {
+                        long long id = tk.get("id") && tk.get("id")->isNum()
+                                           ? static_cast<long long>(tk.get("id")->num) : 0;
+                        std::string st = tk.get("status") ? tk.get("status")->str : "?";
+                        std::string ti = tk.get("title") ? tk.get("title")->str : "";
+                        std::string asg = tk.get("assignee") ? tk.get("assignee")->str : "";
+                        std::cout << "#" << id << "  [" << st << "]  " << ti
+                                  << (asg.empty() ? "" : "  @" + asg) << "\n";
+                    }
+                }
+                return 0;
+            }
+            // claim/submit/verify all need ROOM ID.
+            if (p.pos.size() < 3) {
+                std::cerr << "error: task " << action << " needs ROOM ID\n";
+                return 1;
+            }
+            long long id = 0;
+            try {
+                id = std::stoll(p.pos[2]);
+            } catch (...) {
+                std::cerr << "error: bad task id\n";
+                return 1;
+            }
+            std::string base = "/v1/rooms/" + urlEnc(p.pos[1]) + "/tasks/" + std::to_string(id);
+            if (action == "claim") {
+                Json body = Json::object();
+                body.set("agent", Json::string(defaultAgent(p)));
+                ClientResult r = httpPost(t, base + "/claim", body.dump());
+                if (!r.ok) return fail(r);
+                std::cout << r.body << "\n";
+                return 0;
+            }
+            if (action == "submit") {
+                if (p.pos.size() < 4) {
+                    std::cerr << "error: task submit needs ROOM ID EVIDENCE...\n";
+                    return 1;
+                }
+                std::string evidence;
+                for (size_t i = 3; i < p.pos.size(); i++)
+                    evidence += (evidence.empty() ? "" : " ") + p.pos[i];
+                Json body = Json::object();
+                body.set("agent", Json::string(defaultAgent(p)));
+                body.set("evidence", Json::string(evidence));
+                ClientResult r = httpPost(t, base + "/submit", body.dump());
+                if (!r.ok) return fail(r);
+                std::cout << r.body << "\n";
+                return 0;
+            }
+            if (action == "verify") {
+                Json body = Json::object();
+                body.set("agent", Json::string(defaultAgent(p)));
+                body.set("accept", Json::boolean(!hasFlag(p, "reject")));
+                ClientResult r = httpPost(t, base + "/verify", body.dump());
+                if (!r.ok) return fail(r);
+                std::cout << r.body << "\n";
+                return 0;
+            }
+            std::cerr << "error: unknown task action: " << action << "\n";
+            return 1;
+        }
         if (cmd == "claim") {
             if (p.pos.size() < 2) {
                 std::cerr << "error: claim needs ROOM SCOPE...\n";

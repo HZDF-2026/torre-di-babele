@@ -38,6 +38,9 @@ const char* kProtocolBriefing =
     "answer others with `answer` and `--ref <id>`.\n"
     "5. Leave clean: `greenroom release {room} --scope <s> --agent {name}`, then "
     "`greenroom say {room} done \"<one-line summary>\" --agent {name}`.\n"
+    "6. Task board: `greenroom task list {room}` — claim a task, submit it with "
+    "evidence (`task submit {room} <id> \"<evidence>\"`); a different agent "
+    "verifies. Search old findings: `greenroom search <text>`.\n"
     "Claims expire after their TTL — if your work takes longer, re-claim. The room "
     "is hash-chained and audited; say what you did, do what you said.";
 
@@ -190,6 +193,24 @@ Json toolsList() {
     {
         Json p = Json::object();
         p.set("room", propStr("Room name"));
+        p.set("since", propNum("Wait for messages with id > since; 0 = any message"));
+        p.set("timeout_ms", propNum("Max wait, default 30000; server caps at 60000"));
+        tools.push(toolDef("greenroom_wait",
+                           "Long-poll: block until a new message arrives, then return it. "
+                           "Cheaper than repeated listen calls.",
+                           p, {"room"}));
+    }
+    {
+        Json p = Json::object();
+        p.set("query", propStr("Case-insensitive substring to find in content/agent/type"));
+        p.set("room", propStr("Restrict to one room, optional"));
+        p.set("limit", propNum("Max hits, default 50"));
+        tools.push(toolDef("greenroom_search", "Search messages across all rooms.", p,
+                           {"query"}));
+    }
+    {
+        Json p = Json::object();
+        p.set("room", propStr("Room name"));
         p.set("agent", propStr("Claiming agent name"));
         p.set("scope", propStrArr("Files or task labels to own"));
         p.set("ttl_s", propNum("Lease seconds, default 600"));
@@ -232,6 +253,25 @@ Json toolsList() {
         tools.push(toolDef("greenroom_verify", "Verify the room's SHA-256 message chain.", p,
                            {"room"}));
     }
+    {
+        Json p2 = Json::object();
+        p2.set("action", propStr("create|list|claim|submit|verify"));
+        p2.set("room", propStr("Room name"));
+        p2.set("id", propNum("Task id (claim/submit/verify)"));
+        p2.set("title", propStr("Task title (create)"));
+        p2.set("detail", propStr("Task detail (create, optional)"));
+        p2.set("evidence", propStr("What proves it is done (submit)"));
+        Json acc = Json::object();
+        acc.set("type", Json::string("boolean"));
+        acc.set("description", Json::string("verify: true=accept, false=reject+reopen"));
+        p2.set("accept", std::move(acc));
+        p2.set("agent", propStr("Acting agent name"));
+        tools.push(toolDef("greenroom_task",
+                           "Evidence-gated task board: create, claim, submit (with "
+                           "evidence), verify (must be a different agent than the "
+                           "submitter), list.",
+                           p2, {"action", "room"}));
+    }
     Json out = Json::object();
     out.set("tools", std::move(tools));
     return out;
@@ -240,19 +280,22 @@ Json toolsList() {
 // ---- HTTP proxy helpers ------------------------------------------------
 
 std::string get(const Target& t, const std::string& target) {
-    ClientResult r = httpClient(t.host, t.port, "GET", target, "");
+    ClientResult r =
+        httpClient(t.host, t.port, "GET", target, "", envOr("GREENROOM_TOKEN", ""));
     if (!r.ok && r.status == 0) return "{\"error\":\"transport: " + r.err + "\"}";
     return r.body;
 }
 
 std::string post(const Target& t, const std::string& target, const Json& body) {
-    ClientResult r = httpClient(t.host, t.port, "POST", target, body.dump());
+    ClientResult r =
+        httpClient(t.host, t.port, "POST", target, body.dump(), envOr("GREENROOM_TOKEN", ""));
     if (!r.ok && r.status == 0) return "{\"error\":\"transport: " + r.err + "\"}";
     return r.body;
 }
 
 std::string put(const Target& t, const std::string& target, const Json& body) {
-    ClientResult r = httpClient(t.host, t.port, "PUT", target, body.dump());
+    ClientResult r =
+        httpClient(t.host, t.port, "PUT", target, body.dump(), envOr("GREENROOM_TOKEN", ""));
     if (!r.ok && r.status == 0) return "{\"error\":\"transport: " + r.err + "\"}";
     return r.body;
 }
@@ -295,6 +338,16 @@ std::string callTool(const std::string& name, const Json& args) {
         body.set("name", Json::string(argStr(args, "room")));
         return post(t, "/v1/rooms", body);
     }
+    if (name == "greenroom_search") {
+        std::string q = argStr(args, "query");
+        if (q.empty()) return "{\"error\":\"query required\"}";
+        std::string target = "/v1/search?q=" + urlEnc(q);
+        std::string rf = argStr(args, "room");
+        if (!rf.empty()) target += "&room=" + urlEnc(rf);
+        long long lim = argNum(args, "limit", 0);
+        if (lim > 0) target += "&limit=" + std::to_string(lim);
+        return get(t, target);
+    }
     std::string room = argStr(args, "room");
     if (room.empty()) return "{\"error\":\"room required\"}";
     std::string base = "/v1/rooms/" + urlEnc(room);
@@ -313,6 +366,47 @@ std::string callTool(const std::string& name, const Json& args) {
         if (argNum(args, "limit", 0) > 0)
             q += "&limit=" + std::to_string(argNum(args, "limit", 0));
         return get(t, base + "/messages" + q);
+    }
+    if (name == "greenroom_wait") {
+        std::string q = "?since=" + std::to_string(argNum(args, "since", 0));
+        long long to = argNum(args, "timeout_ms", 0);
+        if (to > 0) q += "&timeout_ms=" + std::to_string(to);
+        return get(t, base + "/wait" + q);
+    }
+    if (name == "greenroom_task") {
+        std::string action = argStr(args, "action");
+        std::string agent = argStr(args, "agent");
+        long long id = argNum(args, "id", 0);
+        if (action == "list") return get(t, base + "/tasks");
+        if (action == "create") {
+            Json body = Json::object();
+            body.set("title", Json::string(argStr(args, "title")));
+            body.set("detail", Json::string(argStr(args, "detail")));
+            body.set("agent", Json::string(agent.empty() ? "anon" : agent));
+            return post(t, base + "/tasks", body);
+        }
+        if (id <= 0) return "{\"error\":\"id required for claim/submit/verify\"}";
+        std::string sub = base + "/tasks/" + std::to_string(id);
+        if (action == "claim") {
+            Json body = Json::object();
+            body.set("agent", Json::string(agent));
+            return post(t, sub + "/claim", body);
+        }
+        if (action == "submit") {
+            Json body = Json::object();
+            body.set("agent", Json::string(agent));
+            body.set("evidence", Json::string(argStr(args, "evidence")));
+            return post(t, sub + "/submit", body);
+        }
+        if (action == "verify") {
+            Json body = Json::object();
+            body.set("agent", Json::string(agent));
+            bool accept = true;
+            if (const Json* a = args.get("accept"); a && a->isBool()) accept = a->b;
+            body.set("accept", Json::boolean(accept));
+            return post(t, sub + "/verify", body);
+        }
+        return "{\"error\":\"unknown action: " + action + "\"}";
     }
     if (name == "greenroom_claim") {
         Json body = Json::object();
@@ -354,16 +448,21 @@ std::string callTool(const std::string& name, const Json& args) {
 // MCP tools work without manual setup. Remote targets are never started.
 void ensureServeRunning() {
     Target t = parseTarget();
-    ClientResult r = httpClient(t.host, t.port, "GET", "/v1/status", "");
-    if (r.ok) return;
+    std::string token = envOr("GREENROOM_TOKEN", "");
+    ClientResult r = httpClient(t.host, t.port, "GET", "/v1/status", "", token);
+    if (r.status != 0) return;  // any HTTP answer (even 401) means it is up
     if (t.host != "127.0.0.1" && t.host != "localhost") return;
     std::vector<std::string> argv{selfExePath(), "serve", "--port", std::to_string(t.port),
                                   "--data", defaultDataDir()};
+    if (!token.empty()) {
+        argv.push_back("--token");
+        argv.push_back(token);
+    }
     std::string err;
     if (!spawnDetached(argv, err)) return;
     for (int i = 0; i < 50; i++) {  // up to 5 s
-        ClientResult probe = httpClient(t.host, t.port, "GET", "/v1/status", "");
-        if (probe.ok) return;
+        ClientResult probe = httpClient(t.host, t.port, "GET", "/v1/status", "", token);
+        if (probe.status != 0) return;
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }

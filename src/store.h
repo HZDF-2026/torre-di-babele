@@ -3,6 +3,7 @@
 #ifndef GR_STORE_H
 #define GR_STORE_H
 
+#include <condition_variable>
 #include <map>
 #include <mutex>
 #include <string>
@@ -15,7 +16,7 @@ struct Message {
     long long id = 0;      // per-room, 1-based
     long long ts = 0;      // unix ms
     std::string agent;
-    std::string type;      // say|plan|fact|ask|answer|claim|release|veto|done
+    std::string type;      // say|plan|fact|ask|answer|claim|release|veto|done|task
     std::string content;
     long long ref = -1;    // referenced message id, -1 = none
     std::string prev;      // hash of previous message, "genesis" for id 1
@@ -46,6 +47,28 @@ struct ClaimOutcome {
     std::string note;                // human-readable summary for messages
 };
 
+// Evidence-gated task (PROTOCOL.md §Tasks). Transitions:
+//   create → open → claim → claimed → submit → submitted →
+//   verify(accept) → done | verify(reject) → open (reopened)
+struct Task {
+    long long id = 0;         // per-room, 1-based
+    std::string title;
+    std::string detail;
+    std::string status;       // open|claimed|submitted|done
+    std::string creator;
+    std::string assignee;     // when claimed/submitted
+    std::string evidence;     // when submitted
+    std::string verifier;     // when done
+    long long createdTs = 0;
+    long long updatedTs = 0;
+};
+
+// One search hit: the message plus the room it lives in.
+struct SearchHit {
+    std::string room;
+    Message msg;
+};
+
 class RoomStore {
 public:
     explicit RoomStore(std::string dataDir);
@@ -64,6 +87,16 @@ public:
                                   int limit, const std::string& typeFilter,
                                   const std::string& agentFilter);
 
+    // Long-poll: blocks up to timeoutMs until a message with id > since exists.
+    // Cap 60 000 ms. Returns every message after since (may be empty on timeout).
+    std::vector<Message> waitMessages(const std::string& room, long long since,
+                                      long long timeoutMs);
+
+    // Case-insensitive ASCII substring search over content/agent/type. Empty
+    // roomFilter = all rooms. Returns newest-first, capped at limit.
+    std::vector<SearchHit> search(const std::string& query,
+                                  const std::string& roomFilter, int limit);
+
     // Claim semantics per PROTOCOL.md: conflict = scope intersects an ACTIVE
     // claim held by a DIFFERENT agent. Same-agent overlap renews the TTL.
     // Records claim/veto/release messages into the stream.
@@ -80,6 +113,19 @@ public:
                   const std::string& value, const std::string& agent);
     std::vector<BoardEntry> boardAll(const std::string& room);
 
+    // Tasks. All throw std::runtime_error on unknown room / bad state.
+    // Every transition records a "task"-type message into the room stream.
+    Task taskCreate(const std::string& room, const std::string& title,
+                    const std::string& detail, const std::string& creator);
+    std::vector<Task> tasks(const std::string& room);
+    Task taskClaim(const std::string& room, long long id, const std::string& agent);
+    Task taskSubmit(const std::string& room, long long id, const std::string& agent,
+                    const std::string& evidence);
+    // accept=false reopens the task (status back to open, assignee cleared).
+    // Verifier must differ from the assignee — that is the evidence gate.
+    Task taskVerify(const std::string& room, long long id, const std::string& agent,
+                    bool accept);
+
     // Recompute the hash chain; on failure errOut says where it broke.
     bool verify(const std::string& room, std::string& errOut);
 
@@ -91,6 +137,8 @@ private:
         std::vector<Claim> claims;
         long long nextClaimId = 1;
         std::vector<BoardEntry> board;
+        std::vector<Task> tasks;
+        long long nextTaskId = 1;
     };
 
     RoomData& load(const std::string& room);   // caller holds mutex
@@ -100,10 +148,13 @@ private:
     std::string roomDir(const std::string& room) const;
     void persistClaims(const std::string& room, RoomData& rd);
     void persistBoard(const std::string& room, RoomData& rd);
+    void persistTasks(const std::string& room, RoomData& rd);
     void sweepExpired(const std::string& room, RoomData& rd);  // caller holds mutex
+    Task* findTask(RoomData& rd, long long id);                // caller holds mutex
 
     std::string dataDir_;
     std::mutex mu_;
+    std::condition_variable cv_;  // notified on every new message
     std::map<std::string, RoomData> cache_;
 };
 

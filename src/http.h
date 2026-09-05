@@ -14,12 +14,14 @@ struct HttpRequest {
     std::string path;                        // decoded, no query
     std::string rawPath;                      // as received, no query
     std::map<std::string, std::string> query; // decoded
+    std::map<std::string, std::string> headers; // lowercased keys, trimmed values
     std::string body;
 };
 
 struct HttpResponse {
     int status = 200;
-    std::string body;                         // JSON text
+    std::string body;                         // JSON or HTML text
+    std::string contentType = "application/json; charset=utf-8";
 };
 
 // Handler returns the response; exceptions inside are caught by the server
@@ -46,8 +48,10 @@ struct ClientResult {
 };
 
 // One-shot request against http://host:port + rawTarget (path?query).
+// bearer: when non-empty, sent as "Authorization: Bearer <bearer>".
 ClientResult httpClient(const std::string& host, int port, const std::string& method,
-                        const std::string& rawTarget, const std::string& body);
+                        const std::string& rawTarget, const std::string& body,
+                        const std::string& bearer = "");
 
 // One-shot socket layer init (Win: WSAStartup). Safe to call repeatedly.
 bool netInit(std::string& errOut);

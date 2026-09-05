@@ -2,24 +2,26 @@
 
 *The room behind the stage. Every actor meets there before the curtain.*
 
-A local chat room for the sub-agents of TRAE Code / TRAE Work. Not public,
-no cloud, no accounts — one binary on your machine, localhost only.
+A chat room for the sub-agents of TRAE Code / TRAE Work. No cloud, no
+accounts — one binary, localhost by default; `--bind` + `--token` opens it
+to your LAN so your other machines can join the same room.
 
 **The problem it solves**: parallel sub-agents spawn, work, and die in
 isolation. One agent's findings are re-read, re-derived, and re-paid by the
 next. Two agents edit the same file and collide. greenroom gives them one
 shared place to coordinate — a blackboard, not a message bus.
 
-One binary, three faces:
+One binary, four faces:
 
 | face | who speaks it | what it does |
 |---|---|---|
-| `greenroom serve` | you, once per machine | localhost HTTP server: append-only rooms, claim leases, shared blackboard, SHA-256 hash chain |
-| `greenroom <cmd>` | sub-agents (shell) | say / listen / claim / release / board / verify |
+| `greenroom serve` | you, once per machine | HTTP server: append-only rooms, claim leases, shared blackboard, evidence-gated task board, full-text search, Web UI, SHA-256 hash chain |
+| `greenroom <cmd>` | sub-agents (shell) | say / listen / wait / claim / release / board / task / search / verify |
 | `greenroom mcp` | the parent agent | MCP stdio server (JSON-RPC 2.0), proxies to `serve` |
+| `http://host:port/` | you, watching | built-in Web UI: live room timeline, claims, board, task board |
 
-Full protocol, message types, claim semantics, and the sub-agent spawn
-template: [PROTOCOL.md](PROTOCOL.md).
+Full protocol, message types, claim semantics, task gate, and the sub-agent
+spawn template: [PROTOCOL.md](PROTOCOL.md).
 
 ## Build
 
@@ -28,14 +30,21 @@ C++17, standard library only, zero third-party dependencies.
 - **Windows 11** (MinGW-w64): `.\build.ps1` → `dist\greenroom.exe`
 - **Linux ARM64** (native g++ ≥ 9): `sh build.sh` → `dist/greenroom`
 
-`make test` runs the unit tests (73 checks: SHA-256, JSON, chain integrity,
-claim conflicts, TTL expiry, persistence).
+Tests: `make test` runs the unit tests (73 checks: SHA-256, JSON, chain
+integrity, claim conflicts, TTL expiry, task gate, search, persistence);
+`powershell -File tests\integration.ps1` runs the end-to-end suite (36
+checks: auth, long-poll, Web UI, search, task lifecycle, MCP, CLI,
+restart persistence).
 
 ## Quick start
 
 ```powershell
 # Windows — terminal 1: start the room (once)
 dist\greenroom.exe serve --port 7788 --data D:\greenroom-data
+
+# open to your LAN (token required then):
+dist\greenroom.exe serve --bind 0.0.0.0 --token a-secret --data D:\greenroom-data
+# → other machines: set GREENROOM_URL=http://<host>:7788, GREENROOM_TOKEN=a-secret
 
 # terminal 2: the conversation
 dist\greenroom.exe create refactor-auth
@@ -51,12 +60,34 @@ dist\greenroom.exe claim refactor-auth src/retry.go --agent impl-2   # → CONFL
 dist\greenroom.exe board set refactor-auth decision/retry "keep, wrap with helper" --agent impl-1
 dist\greenroom.exe board get refactor-auth decision/retry
 
+# the task board (evidence-gated: the assignee cannot verify their own work)
+dist\greenroom.exe task add refactor-auth "port parser to new API" --agent lead
+dist\greenroom.exe task claim refactor-auth 1 --agent impl-1
+dist\greenroom.exe task submit refactor-auth 1 "src/parser.go rewritten, tests pass" --agent impl-1
+dist\greenroom.exe task verify refactor-auth 1 --agent lead        # a DIFFERENT agent
+dist\greenroom.exe task verify refactor-auth 1 --agent impl-1      # → rejected: evidence gate
+
+# search across all rooms
+dist\greenroom.exe search "retry" --room refactor-auth
+
+# wait: block until something new happens (long-poll, cheap)
+dist\greenroom.exe wait refactor-auth --timeout-ms 30000
+
 # audit
 dist\greenroom.exe verify refactor-auth
 ```
 
 Sub-agent defaults via env: `GREENROOM_URL` (default `http://127.0.0.1:7788`),
-`GREENROOM_AGENT` (default `anon`).
+`GREENROOM_AGENT` (default `anon`), `GREENROOM_TOKEN` (bearer token when
+serve runs with `--token`).
+
+## Web UI
+
+`serve` embeds a single-file UI at `http://host:port/` — no build step, no
+external assets. Rooms sidebar, live message timeline (long-polled), claims
+table, blackboard table, and the task board with claim/submit/verify buttons.
+When serve runs with a token, the UI prompts for it (stored in
+localStorage) — the shell itself is always served without auth.
 
 ## TRAE Work integration (MCP)
 
@@ -68,7 +99,10 @@ Add to the MCP configuration (command is the built binary):
     "greenroom": {
       "command": "D:\\greenroom\\dist\\greenroom.exe",
       "args": ["mcp"],
-      "env": { "GREENROOM_URL": "http://127.0.0.1:7788" }
+      "env": {
+        "GREENROOM_URL": "http://127.0.0.1:7788",
+        "GREENROOM_TOKEN": "a-secret"
+      }
     }
   }
 }
@@ -76,15 +110,16 @@ Add to the MCP configuration (command is the built binary):
 
 **Auto-start**: `greenroom mcp` probes the server on startup; if `serve` is
 not running (e.g. after a machine reboot), it spawns a detached
-`greenroom serve` on the same port and waits up to 5 s for readiness. No
-manual `serve` step is needed — the first MCP connection brings the room up
-and the detached server survives the MCP process. Data lands in
-`$GREENROOM_DATA`, else `~/.greenroom`.
+`greenroom serve` on the same port (with the token, if set) and waits up to
+5 s for readiness. No manual `serve` step is needed — the first MCP
+connection brings the room up and the detached server survives the MCP
+process. Data lands in `$GREENROOM_DATA`, else `~/.greenroom`.
 
 Tools: `greenroom_protocol`, `greenroom_status`, `greenroom_rooms`,
 `greenroom_create_room`, `greenroom_say`, `greenroom_listen`,
-`greenroom_claim`, `greenroom_release`, `greenroom_claims`,
-`greenroom_board_get`, `greenroom_board_set`, `greenroom_verify`.
+`greenroom_wait`, `greenroom_search`, `greenroom_claim`,
+`greenroom_release`, `greenroom_claims`, `greenroom_board_get`,
+`greenroom_board_set`, `greenroom_task`, `greenroom_verify`.
 
 `greenroom_protocol` returns the sub-agent briefing (see PROTOCOL.md
 "Sub-agent briefing") — call it once, paste the text into every sub-agent
@@ -99,7 +134,8 @@ Plain files, human-readable, git-friendly:
 ```
 <datadir>/rooms/<room>/messages.jsonl   append-only, one message per line
 <datadir>/rooms/<room>/claims.json      active leases (rewritten on change)
-<datadir>/rooms/<room>/board.json       blackboard KV (rewritten on change)
+<datadir>/rooms/<room>/board.json      blackboard KV (rewritten on change)
+<datadir>/rooms/<room>/tasks.json       task board state (rewritten on change)
 ```
 
 `messages.jsonl` is hash-chained (`verify` recomputes it); tampering with any

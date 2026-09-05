@@ -220,6 +220,15 @@ bool HttpServer::run(std::string& errOut) {
                         }
                     }
                 }
+                // Header lines: "Key: value" — key lowercased for lookup.
+                for (size_t i = 1; i < lines.size(); i++) {
+                    const std::string& ln = lines[i];
+                    size_t colon = ln.find(':');
+                    if (colon == std::string::npos) continue;
+                    std::string key = ln.substr(0, colon);
+                    for (char& c : key) c = static_cast<char>(std::tolower((unsigned char)c));
+                    req.headers[key] = trim(ln.substr(colon + 1));
+                }
             }
 
             // Body by Content-Length.
@@ -263,8 +272,8 @@ bool HttpServer::run(std::string& errOut) {
                 res.body = "{\"error\":\"unknown error\"}";
             }
             std::string out = "HTTP/1.1 " + std::to_string(res.status) + " " + statusText(res.status) +
-                              "\r\nContent-Type: application/json; charset=utf-8\r\n"
-                              "Content-Length: " + std::to_string(res.body.size()) +
+                              "\r\nContent-Type: " + res.contentType +
+                              "\r\nContent-Length: " + std::to_string(res.body.size()) +
                               "\r\nConnection: close\r\n\r\n" + res.body;
             sendAll(cs, out.data(), out.size());
             closeSock(cs);
@@ -273,7 +282,8 @@ bool HttpServer::run(std::string& errOut) {
 }
 
 ClientResult httpClient(const std::string& host, int port, const std::string& method,
-                        const std::string& rawTarget, const std::string& body) {
+                        const std::string& rawTarget, const std::string& body,
+                        const std::string& bearer) {
     ClientResult r;
     std::string err;
     if (!netInit(err)) {
@@ -297,7 +307,9 @@ ClientResult httpClient(const std::string& host, int port, const std::string& me
     }
     std::string req = method + " " + rawTarget + " HTTP/1.1\r\nHost: " + host +
                       "\r\nContent-Type: application/json\r\nContent-Length: " +
-                      std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+                      std::to_string(body.size()) + "\r\nConnection: close\r\n";
+    if (!bearer.empty()) req += "Authorization: Bearer " + bearer + "\r\n";
+    req += "\r\n" + body;
     if (!sendAll(s, req.data(), req.size())) {
         r.err = "send failed";
         closeSock(s);

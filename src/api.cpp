@@ -2,18 +2,24 @@
 //   GET  /v1/status
 //   GET  /v1/rooms                        POST /v1/rooms {"name"}
 //   GET  /v1/rooms/{r}/messages?since&limit&type&agent
+//   GET  /v1/rooms/{r}/wait?since&timeout_ms      (long-poll, blocks)
 //   POST /v1/rooms/{r}/say                {"agent","type","content","ref"?}
 //   POST /v1/rooms/{r}/claim              {"agent","scope":[..],"ttl_s"?}
 //   POST /v1/rooms/{r}/release           {"agent","claim_id"?,"scope"?}
 //   GET  /v1/rooms/{r}/claims
 //   GET  /v1/rooms/{r}/board              GET/PUT /v1/rooms/{r}/board/{key}
+//   GET  /v1/rooms/{r}/tasks              POST /v1/rooms/{r}/tasks {"title",...}
+//   POST /v1/rooms/{r}/tasks/{id}/claim|submit|verify
 //   GET  /v1/rooms/{r}/verify
+//   GET  /v1/search?q&room&limit
+//   GET  /                                (web UI shell, no auth)
 #include "api.h"
 
 #include <stdexcept>
 
 #include "jsjson.h"
 #include "util.h"
+#include "webui.h"
 
 namespace gr {
 
@@ -23,6 +29,14 @@ HttpResponse json(int status, const Json& body) {
     HttpResponse r;
     r.status = status;
     r.body = body.dump();
+    return r;
+}
+
+HttpResponse html(int status, const std::string& body) {
+    HttpResponse r;
+    r.status = status;
+    r.body = body;
+    r.contentType = "text/html; charset=utf-8";
     return r;
 }
 
@@ -81,6 +95,21 @@ Json boardJson(const BoardEntry& e) {
     return j;
 }
 
+Json taskJson(const Task& t) {
+    Json j = Json::object();
+    j.set("id", Json::number(static_cast<double>(t.id)));
+    j.set("title", Json::string(t.title));
+    j.set("detail", Json::string(t.detail));
+    j.set("status", Json::string(t.status));
+    j.set("creator", Json::string(t.creator));
+    j.set("assignee", Json::string(t.assignee));
+    j.set("evidence", Json::string(t.evidence));
+    j.set("verifier", Json::string(t.verifier));
+    j.set("createdTs", Json::number(static_cast<double>(t.createdTs)));
+    j.set("updatedTs", Json::number(static_cast<double>(t.updatedTs)));
+    return j;
+}
+
 // Splits "/v1/rooms/{room}/rest..." into room + rest (rest has no leading '/').
 bool splitRoomPath(const std::string& path, std::string& room, std::string& rest) {
     const std::string prefix = "/v1/rooms/";
@@ -100,9 +129,20 @@ bool splitRoomPath(const std::string& path, std::string& room, std::string& rest
 
 }  // namespace
 
-HttpHandler makeApiRouter(RoomStore& store) {
-    return [&store](const HttpRequest& req) -> HttpResponse {
+HttpHandler makeApiRouter(RoomStore& store, const std::string& token) {
+    return [&store, token](const HttpRequest& req) -> HttpResponse {
         const std::string& p = req.path;
+
+        // The web UI shell needs no auth: it carries no data, and it is how a
+        // human enters the token in the first place.
+        if ((p == "/" || p == "/index.html") && req.method == "GET")
+            return html(200, kWebUiHtml);
+
+        if (!token.empty()) {
+            auto auth = req.headers.find("authorization");
+            if (auth == req.headers.end() || auth->second != "Bearer " + token)
+                return err(401, "unauthorized — pass Authorization: Bearer <token>");
+        }
 
         if (p == "/v1/status" && req.method == "GET") {
             Json j = Json::object();
@@ -163,6 +203,33 @@ HttpHandler makeApiRouter(RoomStore& store) {
                 if (it != req.query.end()) af = it->second;
                 Json arr = Json::array();
                 for (const Message& m : store.messages(room, since, limit, tf, af))
+                    arr.push(msgJson(m));
+                Json j = Json::object();
+                j.set("room", Json::string(room));
+                j.set("messages", std::move(arr));
+                return json(200, j);
+            }
+
+            if (rest == "wait" && req.method == "GET") {
+                long long since = 0, timeoutMs = 30000;
+                auto it = req.query.find("since");
+                if (it != req.query.end()) {
+                    try {
+                        since = std::stoll(it->second);
+                    } catch (...) {
+                        since = 0;
+                    }
+                }
+                it = req.query.find("timeout_ms");
+                if (it != req.query.end()) {
+                    try {
+                        timeoutMs = std::stoll(it->second);
+                    } catch (...) {
+                        timeoutMs = 30000;
+                    }
+                }
+                Json arr = Json::array();
+                for (const Message& m : store.waitMessages(room, since, timeoutMs))
                     arr.push(msgJson(m));
                 Json j = Json::object();
                 j.set("room", Json::string(room));
@@ -280,7 +347,90 @@ HttpHandler makeApiRouter(RoomStore& store) {
                 return err(405, "method not allowed");
             }
 
+            if (rest == "tasks") {
+                if (req.method == "GET") {
+                    Json arr = Json::array();
+                    for (const Task& t : store.tasks(room)) arr.push(taskJson(t));
+                    Json j = Json::object();
+                    j.set("room", Json::string(room));
+                    j.set("tasks", std::move(arr));
+                    return json(200, j);
+                }
+                if (req.method == "POST") {
+                    Json body;
+                    if (!parseBody(req, body)) return err(400, "body must be a JSON object");
+                    try {
+                        Task t = store.taskCreate(room, strField(body, "title"),
+                                                   strField(body, "detail"),
+                                                   strField(body, "agent", "anon"));
+                        return json(200, taskJson(t));
+                    } catch (const std::exception& e) {
+                        return err(400, e.what());
+                    }
+                }
+                return err(405, "method not allowed");
+            }
+
+            if (rest.compare(0, 6, "tasks/") == 0) {
+                std::string tail = rest.substr(6);
+                size_t slash = tail.find('/');
+                if (slash == std::string::npos) return err(404, "unknown endpoint: " + p);
+                long long id = 0;
+                try {
+                    id = std::stoll(tail.substr(0, slash));
+                } catch (...) {
+                    return err(400, "bad task id");
+                }
+                std::string action = tail.substr(slash + 1);
+                Json body;
+                if (!parseBody(req, body)) return err(400, "body must be a JSON object");
+                try {
+                    if (action == "claim" && req.method == "POST")
+                        return json(200, taskJson(store.taskClaim(room, id, strField(body, "agent"))));
+                    if (action == "submit" && req.method == "POST")
+                        return json(200, taskJson(store.taskSubmit(room, id, strField(body, "agent"),
+                                                                   strField(body, "evidence"))));
+                    if (action == "verify" && req.method == "POST") {
+                        const Json* a = body.get("accept");
+                        bool accept = !(a && a->isBool()) || a->b;
+                        return json(200, taskJson(store.taskVerify(room, id, strField(body, "agent"),
+                                                                   accept)));
+                    }
+                } catch (const std::exception& e) {
+                    return err(400, e.what());
+                }
+                return err(404, "unknown endpoint: " + p);
+            }
+
             return err(404, "unknown endpoint: " + p);
+        }
+
+        if (p == "/v1/search" && req.method == "GET") {
+            std::string q, roomF;
+            int limit = 50;
+            auto it = req.query.find("q");
+            if (it != req.query.end()) q = it->second;
+            it = req.query.find("room");
+            if (it != req.query.end()) roomF = it->second;
+            it = req.query.find("limit");
+            if (it != req.query.end()) {
+                try {
+                    limit = std::stoi(it->second);
+                } catch (...) {
+                    limit = 50;
+                }
+            }
+            if (q.empty()) return err(400, "missing q");
+            Json arr = Json::array();
+            for (const SearchHit& h : store.search(q, roomF, limit)) {
+                Json j = msgJson(h.msg);
+                j.set("room", Json::string(h.room));
+                arr.push(std::move(j));
+            }
+            Json j = Json::object();
+            j.set("query", Json::string(q));
+            j.set("hits", std::move(arr));
+            return json(200, j);
         }
 
         return err(404, "unknown endpoint: " + p);
