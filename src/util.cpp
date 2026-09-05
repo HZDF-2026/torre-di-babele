@@ -4,12 +4,18 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <sys/stat.h>
 #include <sys/types.h>
 
 #ifdef _WIN32
 #include <direct.h>
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 namespace gr {
@@ -151,6 +157,85 @@ bool validRoomName(const std::string& name) {
 
 bool validBoardKey(const std::string& key) {
     return key.size() >= 1 && key.size() <= 128 && allChars(key, true);
+}
+
+std::string selfExePath() {
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    return n > 0 ? std::string(buf, n) : std::string("greenroom");
+#else
+    char buf[4096];
+    ssize_t n = ::readlink("/proc/self/exe", buf, sizeof buf - 1);
+    if (n > 0) {
+        buf[n] = 0;
+        return std::string(buf);
+    }
+    return std::string("greenroom");
+#endif
+}
+
+bool spawnDetached(const std::vector<std::string>& argv, std::string& errOut) {
+    if (argv.empty()) {
+        errOut = "empty argv";
+        return false;
+    }
+#ifdef _WIN32
+    std::string cmd;
+    for (size_t i = 0; i < argv.size(); i++) {
+        if (i) cmd += " ";
+        cmd += "\"" + argv[i] + "\"";
+    }
+    STARTUPINFOA si;
+    std::memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi;
+    std::memset(&pi, 0, sizeof pi);
+    if (!CreateProcessA(nullptr, &cmd[0], nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, nullptr,
+                        nullptr, &si, &pi)) {
+        errOut = "CreateProcess failed";
+        return false;
+    }
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return true;
+#else
+    pid_t pid = ::fork();
+    if (pid < 0) {
+        errOut = "fork failed";
+        return false;
+    }
+    if (pid == 0) {
+        ::setsid();
+        int devnull = ::open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            ::dup2(devnull, 0);
+            ::dup2(devnull, 1);
+            ::dup2(devnull, 2);
+        }
+        std::vector<char*> cargv;
+        for (const std::string& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
+        cargv.push_back(nullptr);
+        ::execv(cargv[0], cargv.data());
+        _exit(127);
+    }
+    int st = 0;
+    ::waitpid(pid, &st, 0);  // reap the intermediate child immediately
+    return true;
+#endif
+}
+
+std::string defaultDataDir() {
+    std::string d = envOr("GREENROOM_DATA", "");
+    if (!d.empty()) return d;
+#ifdef _WIN32
+    const char* home = std::getenv("USERPROFILE");
+#else
+    const char* home = std::getenv("HOME");
+#endif
+    if (!home) return "greenroom-data";
+    return std::string(home) + "/.greenroom";
 }
 
 }  // namespace gr

@@ -60,8 +60,7 @@ Sub-agent defaults via env: `GREENROOM_URL` (default `http://127.0.0.1:7788`),
 
 ## TRAE Work integration (MCP)
 
-Add to the MCP configuration (command is the built binary, server must be
-running):
+Add to the MCP configuration (command is the built binary):
 
 ```json
 {
@@ -74,6 +73,13 @@ running):
   }
 }
 ```
+
+**Auto-start**: `greenroom mcp` probes the server on startup; if `serve` is
+not running (e.g. after a machine reboot), it spawns a detached
+`greenroom serve` on the same port and waits up to 5 s for readiness. No
+manual `serve` step is needed — the first MCP connection brings the room up
+and the detached server survives the MCP process. Data lands in
+`$GREENROOM_DATA`, else `~/.greenroom`.
 
 Tools: `greenroom_protocol`, `greenroom_status`, `greenroom_rooms`,
 `greenroom_create_room`, `greenroom_say`, `greenroom_listen`,

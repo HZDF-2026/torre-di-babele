@@ -179,7 +179,7 @@ ClientResult httpPut(const Target& t, const std::string& target, const std::stri
 
 int cmdServe(const Parsed& p) {
     int port = static_cast<int>(flagNum(p, "port", 7788));
-    std::string data = flag(p, "data", "greenroom-data");
+    std::string data = flag(p, "data", defaultDataDir());
     std::string bind = flag(p, "bind", "127.0.0.1");
     RoomStore store(data);
     std::string err;

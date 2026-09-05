@@ -9,8 +9,10 @@
 //   greenroom_verify
 #include "mcp.h"
 
+#include <chrono>
 #include <iostream>
 #include <sstream>
+#include <thread>
 
 #include "http.h"
 #include "jsjson.h"
@@ -348,9 +350,28 @@ std::string callTool(const std::string& name, const Json& args) {
     return "{\"error\":\"unknown tool: " + name + "\"}";
 }
 
+// If serve is not up (e.g. after a machine reboot), start it detached so the
+// MCP tools work without manual setup. Remote targets are never started.
+void ensureServeRunning() {
+    Target t = parseTarget();
+    ClientResult r = httpClient(t.host, t.port, "GET", "/v1/status", "");
+    if (r.ok) return;
+    if (t.host != "127.0.0.1" && t.host != "localhost") return;
+    std::vector<std::string> argv{selfExePath(), "serve", "--port", std::to_string(t.port),
+                                  "--data", defaultDataDir()};
+    std::string err;
+    if (!spawnDetached(argv, err)) return;
+    for (int i = 0; i < 50; i++) {  // up to 5 s
+        ClientResult probe = httpClient(t.host, t.port, "GET", "/v1/status", "");
+        if (probe.ok) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
 }  // namespace
 
 int runMcp() {
+    ensureServeRunning();
     std::string line;
     while (std::getline(std::cin, line)) {
         std::string t = trim(line);
