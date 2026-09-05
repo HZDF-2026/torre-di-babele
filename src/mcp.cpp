@@ -41,6 +41,18 @@ const char* kProtocolBriefing =
     "6. Task board: `greenroom task list {room}` — claim a task, submit it with "
     "evidence (`task submit {room} <id> \"<evidence>\"`); a different agent "
     "verifies. Search old findings: `greenroom search <text>`.\n"
+    "7. Society: check `greenroom_society status` for {room}. If the room has a "
+    "god goal, you are one mortal generation of a society that exists only to "
+    "fulfill it. When your generation's task board drains with the goal still "
+    "open, the server retires your generation and births the next one — start "
+    "from its genesis task (read the full history, assess the gap, plan). Take a "
+    "role (commander, recorder, executor, reviewer, tester); while roles are "
+    "registered, only reviewer/tester agents may verify tasks and goal "
+    "achievement. Propose achievement only with evidence (`goal achieve`); a "
+    "different agent verifies it.\n"
+    "8. Parent loop: the parent agent long-polls `greenroom wait {room}`; on a "
+    "`gen` message it spawns the next generation's sub-agents with this "
+    "briefing, on `goal` ACHIEVED it stops.\n"
     "Claims expire after their TTL — if your work takes longer, re-claim. The room "
     "is hash-chained and audited; say what you did, do what you said.";
 
@@ -272,6 +284,30 @@ Json toolsList() {
                            "submitter), list.",
                            p2, {"action", "room"}));
     }
+    {
+        Json p3 = Json::object();
+        p3.set("action", propStr("status|goal-set|goal-achieve|goal-verify|goal-abandon|"
+                                 "gen-advance|role-take|role-list"));
+        p3.set("room", propStr("Room name"));
+        p3.set("agent", propStr("Acting agent name"));
+        p3.set("text", propStr("goal-set: the god goal text"));
+        p3.set("criteria", propStr("goal-set: what 'achieved' means (optional)"));
+        p3.set("evidence", propStr("goal-achieve: what proves the goal is achieved"));
+        p3.set("reason", propStr("goal-abandon: why"));
+        p3.set("note", propStr("gen-advance: why this generation is being retired"));
+        p3.set("role", propStr("role-take: commander|recorder|executor|reviewer|tester"));
+        Json acc = Json::object();
+        acc.set("type", Json::string("boolean"));
+        acc.set("description", Json::string("goal-verify: true=accept, false=reject"));
+        p3.set("accept", std::move(acc));
+        tools.push(toolDef("greenroom_society",
+                           "The society layer: a god goal the room exists to fulfill, "
+                           "generations of agents (a new one is born automatically "
+                           "whenever a generation drains with the goal still open), and "
+                           "the five roles. While roles are registered only "
+                           "reviewer/tester may verify.",
+                           p3, {"action", "room"}));
+    }
     Json out = Json::object();
     out.set("tools", std::move(tools));
     return out;
@@ -406,6 +442,52 @@ std::string callTool(const std::string& name, const Json& args) {
             body.set("accept", Json::boolean(accept));
             return post(t, sub + "/verify", body);
         }
+        return "{\"error\":\"unknown action: " + action + "\"}";
+    }
+    if (name == "greenroom_society") {
+        std::string action = argStr(args, "action");
+        std::string agent = argStr(args, "agent");
+        if (action == "status") return get(t, base + "/society");
+        if (action == "goal-set") {
+            Json body = Json::object();
+            body.set("text", Json::string(argStr(args, "text")));
+            body.set("criteria", Json::string(argStr(args, "criteria")));
+            body.set("agent", Json::string(agent.empty() ? "anon" : agent));
+            return post(t, base + "/goal", body);
+        }
+        if (action == "goal-achieve") {
+            Json body = Json::object();
+            body.set("agent", Json::string(agent));
+            body.set("evidence", Json::string(argStr(args, "evidence")));
+            return post(t, base + "/goal/achieve", body);
+        }
+        if (action == "goal-verify") {
+            Json body = Json::object();
+            body.set("agent", Json::string(agent));
+            bool accept = true;
+            if (const Json* a = args.get("accept"); a && a->isBool()) accept = a->b;
+            body.set("accept", Json::boolean(accept));
+            return post(t, base + "/goal/verify", body);
+        }
+        if (action == "goal-abandon") {
+            Json body = Json::object();
+            body.set("agent", Json::string(agent));
+            body.set("reason", Json::string(argStr(args, "reason")));
+            return post(t, base + "/goal/abandon", body);
+        }
+        if (action == "gen-advance") {
+            Json body = Json::object();
+            body.set("agent", Json::string(agent));
+            body.set("note", Json::string(argStr(args, "note")));
+            return post(t, base + "/gen/advance", body);
+        }
+        if (action == "role-take") {
+            Json body = Json::object();
+            body.set("role", Json::string(argStr(args, "role")));
+            body.set("agent", Json::string(agent.empty() ? "anon" : agent));
+            return post(t, base + "/roles", body);
+        }
+        if (action == "role-list") return get(t, base + "/roles");
         return "{\"error\":\"unknown action: " + action + "\"}";
     }
     if (name == "greenroom_claim") {

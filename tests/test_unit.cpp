@@ -251,6 +251,219 @@ static void testMessageHashCanonical() {
     CHECK(h != gr::messageHash("genesis", "t", m));
 }
 
+static void testSocietyLifecycle() {
+    gr::RoomStore st(tmpDir("soc"));
+    st.createRoom("t");
+
+    // No goal yet: no society.
+    gr::Society s = st.society("t");
+    CHECK(!s.goal.exists);
+    CHECK(s.gens.empty());
+    CHECK(s.roles.empty());
+
+    // Declare the god goal: gen 1 is born with a genesis task.
+    st.goalSet("t", "ship v1.0", "tag pushed", "founder");
+    s = st.society("t");
+    CHECK(s.goal.exists);
+    CHECK_EQ_STR(s.goal.status, "open");
+    CHECK_EQ_STR(s.goal.proposer, "founder");
+    CHECK(s.gens.size() == 1);
+    CHECK_EQ_STR(s.gens[0].status, "active");
+    auto ts = st.tasks("t");
+    CHECK(ts.size() == 1);  // the genesis task
+    CHECK(ts[0].gen == 1);
+    CHECK_EQ_STR(ts[0].creator, "server");
+
+    // A second goal cannot be declared while one is active.
+    bool threw = false;
+    try { st.goalSet("t", "other", "", "founder"); } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+
+    // Gen-1 agents finish every task: the board drains with the goal still
+    // open → gen 1 retires and gen 2 is born (with its own genesis task).
+    st.taskClaim("t", 1, "a1");
+    st.taskSubmit("t", 1, "a1", "assessment done");
+    st.taskVerify("t", 1, "a2", true);
+    s = st.society("t");
+    CHECK(s.gens.size() == 2);
+    CHECK_EQ_STR(s.gens[0].status, "retired");
+    CHECK_EQ_STR(s.gens[0].note, "task board drained");
+    CHECK_EQ_STR(s.gens[1].status, "active");
+    ts = st.tasks("t");
+    CHECK(ts.size() == 2);
+    CHECK(ts[1].gen == 2);
+
+    // Gen-2 does real work and finishes everything (genesis task included) → gen 3.
+    gr::Task w = st.taskCreate("t", "work", "do it", "a1");
+    CHECK(w.gen == 2);
+    st.taskClaim("t", 2, "a1");
+    st.taskSubmit("t", 2, "a1", "assessment");
+    st.taskClaim("t", w.id, "a1");
+    st.taskSubmit("t", w.id, "a1", "plan ready");
+    st.taskVerify("t", 2, "a2", true);
+    st.taskVerify("t", w.id, "a2", true);
+    CHECK(st.society("t").gens.size() == 3);
+
+    // Achievement with evidence → proposed.
+    st.goalAchieve("t", "a1", "v1.0 tag pushed, release notes attached");
+    s = st.society("t");
+    CHECK_EQ_STR(s.goal.status, "proposed");
+    CHECK_EQ_STR(s.goal.achiever, "a1");
+
+    // The achiever cannot verify his own claim — evidence gate.
+    threw = false;
+    try { st.goalVerify("t", "a1", true); } catch (const std::exception& e) {
+        threw = true;
+        CHECK(std::string(e.what()).find("evidence gate") != std::string::npos);
+    }
+    CHECK(threw);
+
+    // Reject: the goal reopens (gen 3's genesis task is still open, no drain).
+    st.goalVerify("t", "a2", false);
+    s = st.society("t");
+    CHECK_EQ_STR(s.goal.status, "open");
+    CHECK(s.goal.achiever.empty());
+    CHECK(s.gens.size() == 3);
+
+    // Achieve again, accept: society closes, the generation retires.
+    st.goalAchieve("t", "a1", "tag v1.0 pushed");
+    st.goalVerify("t", "a2", true);
+    s = st.society("t");
+    CHECK_EQ_STR(s.goal.status, "achieved");
+    CHECK_EQ_STR(s.goal.verifier, "a2");
+    CHECK(s.goal.closedTs > 0);
+    CHECK_EQ_STR(s.gens.back().status, "retired");
+
+    // A closed society can declare a new goal; generation numbering stays
+    // monotonic (gen 4), so old-lineage tasks can never block a new gen.
+    st.goalSet("t", "ship v2.0", "", "founder2");
+    s = st.society("t");
+    CHECK_EQ_STR(s.goal.status, "open");
+    CHECK(s.gens.size() == 4);
+    CHECK_EQ_STR(s.gens[3].status, "active");
+
+    // Abandon closes it again; double-close is rejected.
+    st.goalAbandon("t", "founder2", "out of scope");
+    CHECK_EQ_STR(st.society("t").goal.status, "abandoned");
+    threw = false;
+    try { st.goalAbandon("t", "founder2", "again"); } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+
+    // The stream recorded the society's messages.
+    int nGoal = 0, nGen = 0;
+    for (const auto& m : st.messages("t", 0, 0, "", "")) {
+        if (m.agent != "server") continue;
+        if (m.type == "goal") nGoal++;
+        if (m.type == "gen") nGen++;
+    }
+    CHECK(nGoal >= 7);  // declare, propose, reject, propose, achieve, declare, abandon
+    CHECK(nGen >= 8);   // 3 born + 2 drained-retired + closed + born + closed
+}
+
+static void testSocietyRoles() {
+    gr::RoomStore st(tmpDir("socroles"));
+    st.createRoom("t");
+    st.goalSet("t", "goal", "", "founder");
+
+    // Unknown role rejected; valid roles register; re-take is idempotent.
+    bool threw = false;
+    try { st.roleTake("t", "a1", "janitor"); } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+    st.roleTake("t", "a1", "executor");
+    st.roleTake("t", "a2", "reviewer");
+    st.roleTake("t", "a3", "tester");
+    st.roleTake("t", "a2", "reviewer");
+    auto s = st.society("t");
+    CHECK(s.roles.size() == 3);
+
+    // Roles gate task verification: a plain agent may not verify.
+    st.taskClaim("t", 1, "a1");
+    st.taskSubmit("t", 1, "a1", "done");
+    threw = false;
+    try { st.taskVerify("t", 1, "a4", true); } catch (const std::exception& e) {
+        threw = true;
+        CHECK(std::string(e.what()).find("reviewer or tester") != std::string::npos);
+    }
+    CHECK(threw);
+    // The reviewer may.
+    st.taskVerify("t", 1, "a2", true);
+    CHECK_EQ_STR(st.tasks("t")[0].status, "done");
+    CHECK(st.society("t").gens.size() == 2);  // drained → gen 2
+
+    // Roles gate goal verification too — a plain agent and the achiever fail.
+    st.goalAchieve("t", "a1", "goal reached");
+    threw = false;
+    try { st.goalVerify("t", "a4", true); } catch (const std::exception& e) {
+        threw = true;
+        CHECK(std::string(e.what()).find("reviewer or tester") != std::string::npos);
+    }
+    CHECK(threw);
+    threw = false;
+    try { st.goalVerify("t", "a1", true); } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+    // The tester verifies; the society closes.
+    st.goalVerify("t", "a3", true);
+    CHECK_EQ_STR(st.society("t").goal.status, "achieved");
+}
+
+static void testSocietyForcedGen() {
+    gr::RoomStore st(tmpDir("socgen"));
+    st.createRoom("t");
+    st.goalSet("t", "goal", "", "founder");
+
+    // genAdvance force-retires even with open tasks on the board.
+    st.genAdvance("t", "founder", "stuck generation");
+    auto s = st.society("t");
+    CHECK(s.gens.size() == 2);
+    CHECK_EQ_STR(s.gens[0].note, "forced by founder: stuck generation");
+    CHECK_EQ_STR(s.gens[1].status, "active");
+    CHECK(st.tasks("t").size() == 2);  // both genesis tasks
+
+    // While an achievement proposal is pending, gen advance is refused.
+    st.goalAchieve("t", "a1", "done");
+    bool threw = false;
+    try { st.genAdvance("t", "a1", "nope"); } catch (const std::exception& e) {
+        threw = true;
+        CHECK(std::string(e.what()).find("pending") != std::string::npos);
+    }
+    CHECK(threw);
+    // A closed society has no generations to advance.
+    st.goalVerify("t", "a2", true);
+    threw = false;
+    try { st.genAdvance("t", "a1", "nope"); } catch (const std::exception& e) {
+        threw = true;
+        CHECK(std::string(e.what()).find("closed") != std::string::npos);
+    }
+    CHECK(threw);
+}
+
+static void testSocietyPersistence() {
+    std::string dir = tmpDir("socpersist");
+    {
+        gr::RoomStore st(dir);
+        st.createRoom("t");
+        st.goalSet("t", "persist the goal", "criteria here", "founder");
+        st.roleTake("t", "rev", "reviewer");
+        st.genAdvance("t", "founder", "forcing");
+        st.goalAchieve("t", "a1", "evidence string");
+    }
+    gr::RoomStore st(dir);
+    auto s = st.society("t");
+    CHECK(s.goal.exists);
+    CHECK_EQ_STR(s.goal.text, "persist the goal");
+    CHECK_EQ_STR(s.goal.criteria, "criteria here");
+    CHECK_EQ_STR(s.goal.status, "proposed");
+    CHECK_EQ_STR(s.goal.achiever, "a1");
+    CHECK_EQ_STR(s.goal.evidence, "evidence string");
+    CHECK(s.gens.size() == 2);
+    CHECK(s.roles.size() == 1);
+    CHECK_EQ_STR(s.roles[0].role, "reviewer");
+    CHECK_EQ_STR(s.roles[0].agent, "rev");
+    // The pending proposal is still verifiable after reload.
+    st.goalVerify("t", "rev", true);
+    CHECK_EQ_STR(st.society("t").goal.status, "achieved");
+}
+
 int main() {
     testSha256();
     testJsonRoundTrip();
@@ -261,6 +474,10 @@ int main() {
     testChainVerify();
     testReloadPersistence();
     testMessageHashCanonical();
+    testSocietyLifecycle();
+    testSocietyRoles();
+    testSocietyForcedGen();
+    testSocietyPersistence();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
 }

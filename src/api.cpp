@@ -10,6 +10,11 @@
 //   GET  /v1/rooms/{r}/board              GET/PUT /v1/rooms/{r}/board/{key}
 //   GET  /v1/rooms/{r}/tasks              POST /v1/rooms/{r}/tasks {"title",...}
 //   POST /v1/rooms/{r}/tasks/{id}/claim|submit|verify
+//   GET  /v1/rooms/{r}/society
+//   POST /v1/rooms/{r}/goal                GET /v1/rooms/{r}/goal
+//   POST /v1/rooms/{r}/goal/achieve|verify|abandon
+//   GET  /v1/rooms/{r}/gen                 POST /v1/rooms/{r}/gen/advance
+//   GET  /v1/rooms/{r}/roles               POST /v1/rooms/{r}/roles {"role","agent"}
 //   GET  /v1/rooms/{r}/verify
 //   GET  /v1/search?q&room&limit
 //   GET  /                                (web UI shell, no auth)
@@ -107,7 +112,46 @@ Json taskJson(const Task& t) {
     j.set("verifier", Json::string(t.verifier));
     j.set("createdTs", Json::number(static_cast<double>(t.createdTs)));
     j.set("updatedTs", Json::number(static_cast<double>(t.updatedTs)));
+    j.set("gen", Json::number(static_cast<double>(t.gen)));
     return j;
+}
+
+Json goalJson(const Goal& g) {
+    Json j = Json::object();
+    j.set("exists", Json::boolean(g.exists));
+    j.set("text", Json::string(g.text));
+    j.set("criteria", Json::string(g.criteria));
+    j.set("status", Json::string(g.status));
+    j.set("proposer", Json::string(g.proposer));
+    j.set("achiever", Json::string(g.achiever));
+    j.set("evidence", Json::string(g.evidence));
+    j.set("verifier", Json::string(g.verifier));
+    j.set("createdTs", Json::number(static_cast<double>(g.createdTs)));
+    j.set("closedTs", Json::number(static_cast<double>(g.closedTs)));
+    return j;
+}
+
+Json genJson(const Generation& g) {
+    Json j = Json::object();
+    j.set("n", Json::number(static_cast<double>(g.n)));
+    j.set("status", Json::string(g.status));
+    j.set("bornTs", Json::number(static_cast<double>(g.bornTs)));
+    j.set("retiredTs", Json::number(static_cast<double>(g.retiredTs)));
+    j.set("note", Json::string(g.note));
+    return j;
+}
+
+Json roleJson(const RoleEntry& r) {
+    Json j = Json::object();
+    j.set("role", Json::string(r.role));
+    j.set("agent", Json::string(r.agent));
+    j.set("ts", Json::number(static_cast<double>(r.ts)));
+    return j;
+}
+
+int activeGen(const Society& s) {
+    if (s.gens.empty() || s.gens.back().status != "active") return 0;
+    return s.gens.back().n;
 }
 
 // Splits "/v1/rooms/{room}/rest..." into room + rest (rest has no leading '/').
@@ -400,6 +444,153 @@ HttpHandler makeApiRouter(RoomStore& store, const std::string& token) {
                     return err(400, e.what());
                 }
                 return err(404, "unknown endpoint: " + p);
+            }
+
+            // ---- society layer ---------------------------------------------
+            if (rest == "society" && req.method == "GET") {
+                Society s = store.society(room);
+                Json j = Json::object();
+                j.set("room", Json::string(room));
+                j.set("goal", goalJson(s.goal));
+                j.set("generation", Json::number(static_cast<double>(activeGen(s))));
+                Json gens = Json::array();
+                for (const Generation& g : s.gens) gens.push(genJson(g));
+                j.set("generations", std::move(gens));
+                Json roles = Json::array();
+                for (const RoleEntry& r : s.roles) roles.push(roleJson(r));
+                j.set("roles", std::move(roles));
+                return json(200, j);
+            }
+
+            if (rest == "goal") {
+                if (req.method == "GET") {
+                    Json j = Json::object();
+                    j.set("room", Json::string(room));
+                    j.set("goal", goalJson(store.society(room).goal));
+                    return json(200, j);
+                }
+                if (req.method == "POST") {
+                    Json body;
+                    if (!parseBody(req, body)) return err(400, "body must be a JSON object");
+                    try {
+                        store.goalSet(room, strField(body, "text"), strField(body, "criteria"),
+                                     strField(body, "agent", "anon"));
+                        Json j = Json::object();
+                        j.set("room", Json::string(room));
+                        j.set("goal", goalJson(store.society(room).goal));
+                        return json(200, j);
+                    } catch (const std::exception& e) {
+                        std::string m = e.what();
+                        return err(m.find("already active") != std::string::npos ? 409 : 400, m);
+                    }
+                }
+                return err(405, "method not allowed");
+            }
+
+            if (rest == "goal/achieve" && req.method == "POST") {
+                Json body;
+                if (!parseBody(req, body)) return err(400, "body must be a JSON object");
+                try {
+                    store.goalAchieve(room, strField(body, "agent"),
+                                      strField(body, "evidence"));
+                } catch (const std::exception& e) {
+                    return err(400, e.what());
+                }
+                Json j = Json::object();
+                j.set("room", Json::string(room));
+                j.set("goal", goalJson(store.society(room).goal));
+                return json(200, j);
+            }
+
+            if (rest == "goal/verify" && req.method == "POST") {
+                Json body;
+                if (!parseBody(req, body)) return err(400, "body must be a JSON object");
+                try {
+                    const Json* a = body.get("accept");
+                    bool accept = !(a && a->isBool()) || a->b;
+                    store.goalVerify(room, strField(body, "agent"), accept);
+                } catch (const std::exception& e) {
+                    return err(400, e.what());
+                }
+                Json j = Json::object();
+                j.set("room", Json::string(room));
+                j.set("goal", goalJson(store.society(room).goal));
+                return json(200, j);
+            }
+
+            if (rest == "goal/abandon" && req.method == "POST") {
+                Json body;
+                if (!parseBody(req, body)) return err(400, "body must be a JSON object");
+                try {
+                    store.goalAbandon(room, strField(body, "agent"),
+                                      strField(body, "reason"));
+                } catch (const std::exception& e) {
+                    return err(400, e.what());
+                }
+                Json j = Json::object();
+                j.set("room", Json::string(room));
+                j.set("goal", goalJson(store.society(room).goal));
+                return json(200, j);
+            }
+
+            if (rest == "gen") {
+                if (req.method != "GET") return err(405, "method not allowed");
+                Society s = store.society(room);
+                Json j = Json::object();
+                j.set("room", Json::string(room));
+                j.set("generation", Json::number(static_cast<double>(activeGen(s))));
+                Json gens = Json::array();
+                for (const Generation& g : s.gens) gens.push(genJson(g));
+                j.set("generations", std::move(gens));
+                return json(200, j);
+            }
+
+            if (rest == "gen/advance" && req.method == "POST") {
+                Json body;
+                if (!parseBody(req, body)) return err(400, "body must be a JSON object");
+                try {
+                    store.genAdvance(room, strField(body, "agent"), strField(body, "note"));
+                } catch (const std::exception& e) {
+                    return err(400, e.what());
+                }
+                Society s = store.society(room);
+                Json j = Json::object();
+                j.set("room", Json::string(room));
+                j.set("generation", Json::number(static_cast<double>(activeGen(s))));
+                Json gens = Json::array();
+                for (const Generation& g : s.gens) gens.push(genJson(g));
+                j.set("generations", std::move(gens));
+                return json(200, j);
+            }
+
+            if (rest == "roles") {
+                if (req.method == "GET") {
+                    Json arr = Json::array();
+                    for (const RoleEntry& r : store.society(room).roles)
+                        arr.push(roleJson(r));
+                    Json j = Json::object();
+                    j.set("room", Json::string(room));
+                    j.set("roles", std::move(arr));
+                    return json(200, j);
+                }
+                if (req.method == "POST") {
+                    Json body;
+                    if (!parseBody(req, body)) return err(400, "body must be a JSON object");
+                    try {
+                        store.roleTake(room, strField(body, "agent", "anon"),
+                                       strField(body, "role"));
+                    } catch (const std::exception& e) {
+                        return err(400, e.what());
+                    }
+                    Json arr = Json::array();
+                    for (const RoleEntry& r : store.society(room).roles)
+                        arr.push(roleJson(r));
+                    Json j = Json::object();
+                    j.set("room", Json::string(room));
+                    j.set("roles", std::move(arr));
+                    return json(200, j);
+                }
+                return err(405, "method not allowed");
             }
 
             return err(404, "unknown endpoint: " + p);

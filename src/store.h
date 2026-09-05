@@ -16,7 +16,7 @@ struct Message {
     long long id = 0;      // per-room, 1-based
     long long ts = 0;      // unix ms
     std::string agent;
-    std::string type;      // say|plan|fact|ask|answer|claim|release|veto|done|task
+    std::string type;      // say|plan|fact|ask|answer|claim|release|veto|done|task|goal|gen|role
     std::string content;
     long long ref = -1;    // referenced message id, -1 = none
     std::string prev;      // hash of previous message, "genesis" for id 1
@@ -61,6 +61,44 @@ struct Task {
     std::string verifier;     // when done
     long long createdTs = 0;
     long long updatedTs = 0;
+    int gen = 0;              // generation this task belongs to (0 = no society)
+};
+
+// The society layer (PROTOCOL.md §Society). A room becomes a society when a
+// God Goal is declared. The society exists only to fulfill that goal; while
+// the goal is open, every drained generation is retired and the next one is
+// born automatically. Roles gate who may verify.
+struct Goal {
+    bool exists = false;
+    std::string text;         // the God Goal itself
+    std::string criteria;     // what "achieved" means
+    std::string status;       // open|proposed|achieved|abandoned
+    std::string proposer;     // who declared it
+    std::string achiever;     // who claimed achievement (when proposed)
+    std::string evidence;     // the claimed achievement evidence
+    std::string verifier;     // who verified the achievement
+    long long createdTs = 0;
+    long long closedTs = 0;
+};
+
+struct Generation {
+    int n = 0;                // 1-based
+    std::string status;       // active|retired
+    long long bornTs = 0;
+    long long retiredTs = 0;
+    std::string note;         // why it retired
+};
+
+struct RoleEntry {
+    std::string role;         // commander|recorder|executor|reviewer|tester
+    std::string agent;
+    long long ts = 0;
+};
+
+struct Society {
+    Goal goal;
+    std::vector<Generation> gens;
+    std::vector<RoleEntry> roles;
 };
 
 // One search hit: the message plus the room it lives in.
@@ -129,6 +167,33 @@ public:
     // Recompute the hash chain; on failure errOut says where it broke.
     bool verify(const std::string& room, std::string& errOut);
 
+    // Society layer (PROTOCOL.md §Society). All throw std::runtime_error on
+    // unknown room / bad state; every transition records goal/gen/role
+    // messages into the room stream.
+    Society society(const std::string& room);
+    // Declares the God Goal — births generation 1 with a genesis task.
+    // Throws when a goal is already active (open or proposed).
+    void goalSet(const std::string& room, const std::string& text,
+                 const std::string& criteria, const std::string& agent);
+    // Claims the goal is achieved; needs evidence; sets status "proposed".
+    void goalAchieve(const std::string& room, const std::string& agent,
+                     const std::string& evidence);
+    // Verifies a proposed achievement. Verifier must differ from the achiever
+    // and (while roles are registered) hold the reviewer or tester role.
+    // accept=true closes the society; reject reopens the goal (and may birth
+    // the next generation if the board drained meanwhile).
+    void goalVerify(const std::string& room, const std::string& agent, bool accept);
+    // Gives up on the goal; closes the society as abandoned.
+    void goalAbandon(const std::string& room, const std::string& agent,
+                     const std::string& reason);
+    // Force-retires the active generation and births the next one (for stuck
+    // generations whose tasks will never finish).
+    void genAdvance(const std::string& room, const std::string& agent,
+                    const std::string& note);
+    // Registers an agent under one of the five roles.
+    void roleTake(const std::string& room, const std::string& agent,
+                  const std::string& role);
+
     const std::string& dataDir() const { return dataDir_; }
 
 private:
@@ -139,6 +204,7 @@ private:
         std::vector<BoardEntry> board;
         std::vector<Task> tasks;
         long long nextTaskId = 1;
+        Society soc;
     };
 
     RoomData& load(const std::string& room);   // caller holds mutex
@@ -149,8 +215,16 @@ private:
     void persistClaims(const std::string& room, RoomData& rd);
     void persistBoard(const std::string& room, RoomData& rd);
     void persistTasks(const std::string& room, RoomData& rd);
+    void persistSociety(const std::string& room, RoomData& rd);
     void sweepExpired(const std::string& room, RoomData& rd);  // caller holds mutex
     Task* findTask(RoomData& rd, long long id);                // caller holds mutex
+    Task createTaskLocked(const std::string& room, RoomData& rd, const std::string& title,
+                          const std::string& detail, const std::string& creator, int gen);
+    int currentGenLocked(const RoomData& rd) const;
+    bool hasVerifyRoleLocked(const RoomData& rd, const std::string& agent) const;
+    void retireGenLocked(const std::string& room, RoomData& rd, const std::string& note);
+    void birthGenLocked(const std::string& room, RoomData& rd);
+    void checkGenDrainLocked(const std::string& room, RoomData& rd);
 
     std::string dataDir_;
     std::mutex mu_;

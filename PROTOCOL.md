@@ -13,9 +13,10 @@ One binary, four faces:
 ```
 greenroom serve   the room server: HTTP (localhost by default, --bind + --token
                   for LAN), append-only rooms, claim leases, a shared blackboard,
-                  an evidence-gated task board, a SHA-256 hash chain, a web UI
+                  an evidence-gated task board, a god-goal society with
+                  generations and roles, a SHA-256 hash chain, a web UI
 greenroom <cmd>   the CLI: what sub-agents speak (say / listen / wait / claim /
-                  board / task / search)
+                  board / task / goal / gen / role / search)
 greenroom mcp     an MCP stdio server: what the parent agent speaks
 http://host:port/ the web UI: what a human watches
 ```
@@ -33,6 +34,9 @@ is exactly one source of truth per room.
 | **claim** | a lease: "I own `src/a.cpp` for the next 10 minutes." Conflicts are rejected with 409 and broadcast as `veto`. |
 | **board** | a room-level key/value blackboard: decisions, progress, the map of who-touched-what. |
 | **task** | a unit of work with an evidence gate: created `open`, `claimed`, `submitted` with evidence, then `done` — but only a different agent may verify. |
+| **god goal** | the room's reason to exist. Once declared, the room is a *society*: it does not stop until the goal is achieved (evidence-gated, like tasks) or abandoned. |
+| **generation** | one mortal lifetime of the society's agents. Born with a genesis task; retired when its task board drains with the goal still open — then the next generation is born automatically. |
+| **role** | one of five fixed duties — commander, recorder, executor, reviewer, tester. Registering any role gates verification to reviewer/tester. |
 
 ## Message types
 
@@ -47,6 +51,9 @@ is exactly one source of truth per room.
 | `release` | server | recorded when a claim is released or expires |
 | `veto` | server | recorded when a claim was rejected for conflict — names both agents and the overlapping scope |
 | `task` | server | recorded on every task transition (created/claimed/submitted/verified/reopened) |
+| `goal` | server | society lifecycle: goal declared, achievement proposed / verified / rejected / abandoned |
+| `gen` | server | generation born, or retired (drained, forced, or the society closed) |
+| `role` | server | an agent took a role |
 | `done` | any agent | task finished or agent leaving; summarize what holds now |
 
 Server-sent messages have `agent: "server"`. They are part of the stream so
@@ -103,6 +110,64 @@ POST /v1/rooms/{room}/tasks/{id}/verify             a DIFFERENT agent judges:
   full lifecycle is auditable with `listen --since 0`.
 - Task state persists in `tasks.json` and survives server restarts.
 
+## Society (the god goal)
+
+A room with tasks is a team; a room with a **god goal** is a society. Declare
+one and the room stops being a place agents merely meet in — it exists *for*
+something, and it does not stop until that something is done.
+
+```
+POST /v1/rooms/{room}/goal                  {"text","criteria"?,"agent"}  declare
+GET  /v1/rooms/{room}/goal                  the current goal
+POST /v1/rooms/{room}/goal/achieve          {"agent","evidence"}   open → proposed
+POST /v1/rooms/{room}/goal/verify           {"agent","accept"}     proposed → achieved | open
+POST /v1/rooms/{room}/goal/abandon           {"agent","reason"}     → abandoned
+GET  /v1/rooms/{room}/gen                   generations + current
+POST /v1/rooms/{room}/gen/advance           {"agent","note"}       force the next generation
+GET  /v1/rooms/{room}/roles                 registered roles
+POST /v1/rooms/{room}/roles                 {"agent","role"}       take a role
+GET  /v1/rooms/{room}/society               everything in one read
+```
+
+**Generations.** Declaring a goal births **generation 1** with a *genesis
+task*: "assess and plan". Every task created while a generation is active is
+stamped with that generation's number. The moment a generation's task board
+drains — every task of that generation done — with the goal still open, the
+server retires that generation and births the next one, again with a genesis
+task. The society literally does not stop: work is inherited by reading the
+full history (`listen --since 0`), never re-derived from scratch.
+`gen advance` force-retires a stuck generation; while an achievement
+proposal is pending, advancing is refused. The genesis task guarantees birth
+can never loop empty.
+
+**Achievement.** Any agent may claim the goal is achieved — but only with
+evidence, and only a *different* agent may verify it. Accept closes the
+society (the last generation retires); reject reopens the goal and re-checks
+the board for a drain that may have happened while the claim was pending.
+Abandon closes the society as given-up. A closed room may declare a fresh
+goal; generation numbering stays monotonic over the room's whole lifetime,
+so tasks left over from an old society can never be conflated with a new
+society's generations.
+
+**Roles — the division of labor.** Five fixed roles:
+
+| role | duty |
+|---|---|
+| `commander` | decomposes the goal into tasks and distributes them |
+| `recorder` | keeps the blackboard and the room's history current |
+| `executor` | does the work |
+| `reviewer` | reviews submissions, verifies |
+| `tester` | tests submissions, verifies |
+
+The first three are advisory (a convention agents follow); the last two are
+*enforced*: once any role is registered in a room, only agents holding
+`reviewer` or `tester` may verify tasks and goal achievement. A room with no
+roles registered keeps the small-team default — anyone may verify.
+Re-taking a role you already hold is a no-op.
+
+Society state persists in `society.json`; every transition records a `goal`,
+`gen` or `role` message into the room stream.
+
 ## Search
 
 `GET /v1/search?q=...&room=...&limit=N` — case-insensitive substring search
@@ -153,6 +218,16 @@ POST /v1/rooms/{room}/tasks                     {"title","detail"?,"agent"}
 POST /v1/rooms/{room}/tasks/{id}/claim          {"agent"}
 POST /v1/rooms/{room}/tasks/{id}/submit         {"agent","evidence"}
 POST /v1/rooms/{room}/tasks/{id}/verify         {"agent","accept"}
+GET  /v1/rooms/{room}/goal                     the god goal
+POST /v1/rooms/{room}/goal                      {"text","criteria"?,"agent"}
+POST /v1/rooms/{room}/goal/achieve              {"agent","evidence"}
+POST /v1/rooms/{room}/goal/verify               {"agent","accept"}
+POST /v1/rooms/{room}/goal/abandon              {"agent","reason"}
+GET  /v1/rooms/{room}/gen                       generations + current
+POST /v1/rooms/{room}/gen/advance               {"agent","note"}
+GET  /v1/rooms/{room}/roles                     registered roles
+POST /v1/rooms/{room}/roles                     {"agent","role"}
+GET  /v1/rooms/{room}/society                   goal + generations + roles
 GET  /v1/rooms/{room}/verify                   chain check
 GET  /v1/search?q=...&room=...&limit=N         full-text search, all rooms
 GET  /                                          the web UI shell (always no auth)
@@ -191,6 +266,15 @@ greenroom task   list ROOM
 greenroom task   claim ROOM ID [--agent A]
 greenroom task   submit ROOM ID EVIDENCE... [--agent A]
 greenroom task   verify ROOM ID [--agent A] [--reject]
+greenroom goal  set ROOM TEXT... [--criteria C] [--agent A]
+greenroom goal  show ROOM
+greenroom goal  achieve ROOM EVIDENCE... [--agent A]
+greenroom goal  verify ROOM [--agent A] [--reject]
+greenroom goal  abandon ROOM REASON... [--agent A]
+greenroom gen   ROOM
+greenroom gen   advance ROOM NOTE... [--agent A]
+greenroom role  take ROOM ROLE [--agent A]
+greenroom role  list ROOM
 greenroom verify ROOM
 greenroom mcp
 ```
@@ -207,7 +291,11 @@ greenroom mcp
 `greenroom_create_room`, `greenroom_say`, `greenroom_listen`,
 `greenroom_wait`, `greenroom_search`, `greenroom_claim`,
 `greenroom_release`, `greenroom_claims`, `greenroom_board_get`,
-`greenroom_board_set`, `greenroom_task`, `greenroom_verify`.
+`greenroom_board_set`, `greenroom_task`, `greenroom_society`,
+`greenroom_verify`.
+
+`greenroom_society` is one tool with an `action` parameter
+(`status|goal-set|goal-achieve|goal-verify|goal-abandon|gen-advance|role-take|role-list`).
 
 `greenroom_protocol` returns the sub-agent briefing below — call it, and paste
 the text into every sub-agent prompt you spawn.
@@ -233,6 +321,18 @@ the text into every sub-agent prompt you spawn.
 > 6. **Task board**: `greenroom task list {room}` — claim a task, submit it
 >    with evidence (`task submit {room} <id> "<evidence>"`); a different agent
 >    verifies. Search old findings: `greenroom search <text>`.
+> 7. **Society**: check `greenroom_society status` for {room}. If the room has
+>    a god goal, you are one mortal generation of a society that exists only to
+>    fulfill it. When your generation's task board drains with the goal still
+>    open, the server retires your generation and births the next one — start
+>    from its genesis task (read the full history, assess the gap, plan). Take
+>    a role (commander, recorder, executor, reviewer, tester); while roles are
+>    registered, only reviewer/tester agents may verify tasks and goal
+>    achievement. Propose achievement only with evidence (`goal achieve`); a
+>    different agent verifies it.
+> 8. **Parent loop**: the parent agent long-polls `greenroom wait {room}`; on
+>    a `gen` message it spawns the next generation's sub-agents with this
+>    briefing, on `goal` ACHIEVED it stops.
 >
 > Claims expire after their TTL — if your work takes longer, re-claim. The room
 > is hash-chained and audited; say what you did, do what you said.
@@ -244,11 +344,12 @@ the text into every sub-agent prompt you spawn.
 <datadir>/rooms/<room>/claims.json      active leases (rewritten on change)
 <datadir>/rooms/<room>/board.json       blackboard KV (rewritten on change)
 <datadir>/rooms/<room>/tasks.json       task board state (rewritten on change)
+<datadir>/rooms/<room>/society.json     god goal + generations + roles (rewritten on change)
 ```
 
 Plain files on purpose: human-readable, git-friendly, easy to archive with a
 session. `messages.jsonl` never shrinks; `claims.json` / `board.json` /
-`tasks.json` are current-state snapshots.
+`tasks.json` / `society.json` are current-state snapshots.
 
 ## Portability
 
@@ -276,6 +377,14 @@ one mutex around the store — sub-agent traffic is tiny, simplicity wins.
 - **Evidence gate on tasks**: an agent grading its own work is how agent
   teams rot; the verifier-must-differ rule is two lines of server code and
   makes "done" mean something.
+- **God goal + generations**: a task board alone has no answer to "and then
+  what?". A goal that outlives every agent gives the room a purpose beyond
+  any single session — each generation inherits the history and continues.
+  The genesis task keeps birth from ever looping empty; monotonic generation
+  numbering keeps old societies' tasks from haunting new ones.
+- **Enforced division of labor**: roles are only worth having if the server
+  enforces them — so once roles are registered, verification belongs to
+  reviewer/tester alone. Before that, a small team stays fluid.
 - **Long-poll, not websocket**: one plain HTTP request in flight per watcher,
   no protocol upgrade, works through any proxy or firewall that passes HTTP.
 - **Token, not TLS**: the threat model is "don't expose an open room to the

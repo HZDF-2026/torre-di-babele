@@ -38,10 +38,20 @@ void usage() {
               << "  greenroom task claim ROOM ID [--agent A]\n"
               << "  greenroom task submit ROOM ID EVIDENCE... [--agent A]\n"
               << "  greenroom task verify ROOM ID [--agent A] [--reject]\n"
+              << "  greenroom goal  set ROOM TEXT... [--criteria C] [--agent A]\n"
+              << "  greenroom goal  show ROOM\n"
+              << "  greenroom goal  achieve ROOM EVIDENCE... [--agent A]\n"
+              << "  greenroom goal  verify ROOM [--agent A] [--reject]\n"
+              << "  greenroom goal  abandon ROOM REASON... [--agent A]\n"
+              << "  greenroom gen   ROOM\n"
+              << "  greenroom gen   advance ROOM NOTE... [--agent A]\n"
+              << "  greenroom role  take ROOM ROLE [--agent A]\n"
+              << "  greenroom role  list ROOM\n"
               << "  greenroom verify ROOM\n"
               << "  greenroom mcp\n"
               << "\n"
-              << "types: say plan fact ask answer done task\n"
+              << "types: say plan fact ask answer done task goal gen role\n"
+              << "roles: commander recorder executor reviewer tester\n"
               << "env:   GREENROOM_URL (default http://127.0.0.1:7788)\n"
               << "       GREENROOM_TOKEN (Bearer token when serve runs with --token)\n"
               << "       GREENROOM_AGENT (default --agent, else 'anon')\n"
@@ -286,7 +296,8 @@ int runCli(const std::vector<std::string>& args) {
     {
         Parsed p;
         if (!parseArgs(rest, p, {"port", "data", "bind", "token", "agent", "ref", "since",
-                                 "limit", "ttl", "id", "scope", "timeout-ms", "detail", "room"}))
+                                 "limit", "ttl", "id", "scope", "timeout-ms", "detail", "room",
+                                 "criteria"}))
             return 1;
         if (cmd == "serve") return cmdServe(p);
 
@@ -452,6 +463,172 @@ int runCli(const std::vector<std::string>& args) {
                 return 0;
             }
             std::cerr << "error: unknown task action: " << action << "\n";
+            return 1;
+        }
+        if (cmd == "goal") {
+            if (p.pos.size() < 2) {
+                std::cerr << "error: goal set|show|achieve|verify|abandon ...\n";
+                return 1;
+            }
+            std::string action = p.pos[0];
+            auto joinRest = [&](size_t from) {
+                std::string out;
+                for (size_t i = from; i < p.pos.size(); i++)
+                    out += (out.empty() ? "" : " ") + p.pos[i];
+                return out;
+            };
+            if (action == "set") {
+                if (p.pos.size() < 3) {
+                    std::cerr << "error: goal set needs ROOM TEXT...\n";
+                    return 1;
+                }
+                Json body = Json::object();
+                body.set("text", Json::string(joinRest(2)));
+                body.set("criteria", Json::string(flag(p, "criteria")));
+                body.set("agent", Json::string(defaultAgent(p)));
+                ClientResult r =
+                    httpPost(t, "/v1/rooms/" + urlEnc(p.pos[1]) + "/goal", body.dump());
+                if (!r.ok) return fail(r);
+                std::cout << r.body << "\n";
+                return 0;
+            }
+            if (action == "show") {
+                ClientResult r = httpGet(t, "/v1/rooms/" + urlEnc(p.pos[1]) + "/goal");
+                if (!r.ok) return fail(r);
+                Json body;
+                if (!Json::parse(r.body, body) || !body.get("goal")) {
+                    std::cerr << "error: bad response\n";
+                    return 1;
+                }
+                const Json& g = *body.get("goal");
+                if (g.get("exists") && g.get("exists")->isBool() && !g.get("exists")->b) {
+                    std::cout << "no god goal declared — the room is not a society\n";
+                    return 0;
+                }
+                std::cout << "goal:    " << (g.get("text") ? g.get("text")->str : "?") << "\n"
+                          << "status:  " << (g.get("status") ? g.get("status")->str : "?") << "\n"
+                          << "criteria:" << (g.get("criteria") ? g.get("criteria")->str : "") << "\n"
+                          << "declared by: "
+                          << (g.get("proposer") ? g.get("proposer")->str : "?") << "\n";
+                if (g.get("evidence") && !g.get("evidence")->str.empty())
+                    std::cout << "evidence:" << g.get("evidence")->str << "\n";
+                if (g.get("verifier") && !g.get("verifier")->str.empty())
+                    std::cout << "verified by: " << g.get("verifier")->str << "\n";
+                return 0;
+            }
+            if (action == "achieve") {
+                if (p.pos.size() < 3) {
+                    std::cerr << "error: goal achieve needs ROOM EVIDENCE...\n";
+                    return 1;
+                }
+                Json body = Json::object();
+                body.set("agent", Json::string(defaultAgent(p)));
+                body.set("evidence", Json::string(joinRest(2)));
+                ClientResult r =
+                    httpPost(t, "/v1/rooms/" + urlEnc(p.pos[1]) + "/goal/achieve", body.dump());
+                if (!r.ok) return fail(r);
+                std::cout << r.body << "\n";
+                return 0;
+            }
+            if (action == "verify") {
+                Json body = Json::object();
+                body.set("agent", Json::string(defaultAgent(p)));
+                body.set("accept", Json::boolean(!hasFlag(p, "reject")));
+                ClientResult r =
+                    httpPost(t, "/v1/rooms/" + urlEnc(p.pos[1]) + "/goal/verify", body.dump());
+                if (!r.ok) return fail(r);
+                std::cout << r.body << "\n";
+                return 0;
+            }
+            if (action == "abandon") {
+                Json body = Json::object();
+                body.set("agent", Json::string(defaultAgent(p)));
+                body.set("reason", Json::string(joinRest(2)));
+                ClientResult r =
+                    httpPost(t, "/v1/rooms/" + urlEnc(p.pos[1]) + "/goal/abandon", body.dump());
+                if (!r.ok) return fail(r);
+                std::cout << r.body << "\n";
+                return 0;
+            }
+            std::cerr << "error: unknown goal action: " << action << "\n";
+            return 1;
+        }
+        if (cmd == "gen") {
+            if (p.pos.empty()) {
+                std::cerr << "error: gen needs ROOM (or: gen advance ROOM NOTE...)\n";
+                return 1;
+            }
+            if (p.pos[0] == "advance") {
+                if (p.pos.size() < 3) {
+                    std::cerr << "error: gen advance needs ROOM NOTE...\n";
+                    return 1;
+                }
+                std::string note;
+                for (size_t i = 2; i < p.pos.size(); i++)
+                    note += (note.empty() ? "" : " ") + p.pos[i];
+                Json body = Json::object();
+                body.set("agent", Json::string(defaultAgent(p)));
+                body.set("note", Json::string(note));
+                ClientResult r =
+                    httpPost(t, "/v1/rooms/" + urlEnc(p.pos[1]) + "/gen/advance", body.dump());
+                if (!r.ok) return fail(r);
+                std::cout << r.body << "\n";
+                return 0;
+            }
+            ClientResult r = httpGet(t, "/v1/rooms/" + urlEnc(p.pos[0]) + "/gen");
+            if (!r.ok) return fail(r);
+            Json body;
+            if (!Json::parse(r.body, body) || !body.get("generations")) {
+                std::cerr << "error: bad response\n";
+                return 1;
+            }
+            long long curGen = body.get("generation") && body.get("generation")->isNum()
+                                   ? static_cast<long long>(body.get("generation")->num) : 0;
+            if (curGen == 0) std::cout << "no active generation (no god goal declared)\n";
+            else std::cout << "active generation: " << curGen << "\n";
+            for (const Json& g : body.get("generations")->arr) {
+                long long n = g.get("n") && g.get("n")->isNum()
+                                  ? static_cast<long long>(g.get("n")->num) : 0;
+                std::string st = g.get("status") ? g.get("status")->str : "?";
+                std::string note = g.get("note") ? g.get("note")->str : "";
+                std::cout << "gen " << n << "  [" << st << "]"
+                          << (note.empty() ? "" : "  " + note) << "\n";
+            }
+            return 0;
+        }
+        if (cmd == "role") {
+            if (p.pos.size() < 2) {
+                std::cerr << "error: role take ROOM ROLE | role list ROOM\n";
+                return 1;
+            }
+            if (p.pos[0] == "take") {
+                if (p.pos.size() < 3) {
+                    std::cerr << "error: role take needs ROOM ROLE\n";
+                    return 1;
+                }
+                Json body = Json::object();
+                body.set("role", Json::string(p.pos[2]));
+                body.set("agent", Json::string(defaultAgent(p)));
+                ClientResult r =
+                    httpPost(t, "/v1/rooms/" + urlEnc(p.pos[1]) + "/roles", body.dump());
+                if (!r.ok) return fail(r);
+                std::cout << r.body << "\n";
+                return 0;
+            }
+            if (p.pos[0] == "list") {
+                ClientResult r = httpGet(t, "/v1/rooms/" + urlEnc(p.pos[1]) + "/roles");
+                if (!r.ok) return fail(r);
+                Json body;
+                if (!Json::parse(r.body, body) || !body.get("roles")) {
+                    std::cerr << "error: bad response\n";
+                    return 1;
+                }
+                for (const Json& e : body.get("roles")->arr)
+                    std::cout << (e.get("role") ? e.get("role")->str : "?") << "  "
+                              << (e.get("agent") ? e.get("agent")->str : "?") << "\n";
+                return 0;
+            }
+            std::cerr << "error: unknown role action: " << p.pos[0] << "\n";
             return 1;
         }
         if (cmd == "claim") {

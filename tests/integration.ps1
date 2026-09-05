@@ -157,6 +157,65 @@ try {
     $v = Api "GET" "/v1/rooms/it-room/verify"
     Check "hash chain verifies" ($v.ok -eq $true)
 
+    # --- P7: society layer ---------------------------------------------------
+    $null = Api "POST" "/v1/rooms" '{"name":"soc-room"}'
+
+    $s = Api "GET" "/v1/rooms/soc-room/society"
+    Check "society empty without goal" ($s.goal.exists -eq $false -and $s.generation -eq 0)
+
+    $g = Api "POST" "/v1/rooms/soc-room/goal" '{"text":"make the integration test pass","criteria":"all checks green","agent":"founder"}'
+    Check "goal set" ($g.goal.status -eq "open" -and $g.goal.proposer -eq "founder")
+    $s = Api "GET" "/v1/rooms/soc-room/society"
+    Check "gen 1 born" ($s.generation -eq 1 -and $s.generations.Count -eq 1)
+    Check "genesis task created" ((Api "GET" "/v1/rooms/soc-room/tasks").tasks.Count -eq 1)
+
+    $r = Api "POST" "/v1/rooms/soc-room/goal" '{"text":"another","agent":"founder"}'
+    Check "second goal rejected 409" ($r._status -eq 409)
+
+    $r = Api "POST" "/v1/rooms/soc-room/roles" '{"agent":"bob","role":"janitor"}'
+    Check "unknown role rejected" ($r._status -ge 400)
+    $r = Api "POST" "/v1/rooms/soc-room/roles" '{"agent":"bob","role":"reviewer"}'
+    Check "role take reviewer" (($r.roles | Where-Object { $_.role -eq "reviewer" -and $_.agent -eq "bob" }) -ne $null)
+
+    # finish gen 1's genesis task → drain → gen 2; role gate applies to verification
+    $tk = (Api "GET" "/v1/rooms/soc-room/tasks").tasks[0]
+    $null = Api "POST" "/v1/rooms/soc-room/tasks/$($tk.id)/claim" '{"agent":"alice"}'
+    $null = Api "POST" "/v1/rooms/soc-room/tasks/$($tk.id)/submit" '{"agent":"alice","evidence":"assessed"}'
+    $r = Api "POST" "/v1/rooms/soc-room/tasks/$($tk.id)/verify" '{"agent":"carol","accept":true}'
+    Check "plain agent verify rejected (role gate)" ($r._status -ge 400 -and (($r.error -join "") -match "reviewer or tester"))
+    $r = Api "POST" "/v1/rooms/soc-room/tasks/$($tk.id)/verify" '{"agent":"bob","accept":true}'
+    Check "reviewer verifies task" ($r.status -eq "done")
+    $s = Api "GET" "/v1/rooms/soc-room/society"
+    Check "drain rolled to gen 2" ($s.generation -eq 2 -and $s.generations[0].status -eq "retired")
+
+    # goal achievement round-trip with evidence gate + role gate
+    $null = Api "POST" "/v1/rooms/soc-room/goal/achieve" '{"agent":"alice","evidence":"all checks green"}'
+    $r = Api "POST" "/v1/rooms/soc-room/goal/verify" '{"agent":"alice","accept":true}'
+    Check "self-verify rejected (evidence gate)" ($r._status -ge 400 -and (($r.error -join "") -match "evidence gate"))
+    $r = Api "POST" "/v1/rooms/soc-room/goal/verify" '{"agent":"carol","accept":true}'
+    Check "plain agent goal-verify rejected (role gate)" ($r._status -ge 400)
+    $r = Api "POST" "/v1/rooms/soc-room/goal/verify" '{"agent":"bob","accept":true}'
+    Check "goal achieved by reviewer" ($r.goal.status -eq "achieved" -and $r.goal.verifier -eq "bob")
+    $s = Api "GET" "/v1/rooms/soc-room/society"
+    Check "society closed, gen retired" ($s.generation -eq 0 -and $s.generations[-1].status -eq "retired")
+
+    # new society: numbering stays monotonic
+    $null = Api "POST" "/v1/rooms/soc-room/goal" '{"text":"second society","agent":"founder"}'
+    Check "new goal births gen 3 (monotonic)" ((Api "GET" "/v1/rooms/soc-room/society").generation -eq 3)
+
+    $null = Api "POST" "/v1/rooms/soc-room/gen/advance" '{"agent":"founder","note":"stuck"}'
+    Check "gen advance forced" ((Api "GET" "/v1/rooms/soc-room/society").generation -eq 4)
+
+    $null = Api "POST" "/v1/rooms/soc-room/goal/abandon" '{"agent":"founder","reason":"done testing"}'
+    Check "goal abandoned" ((Api "GET" "/v1/rooms/soc-room/society").goal.status -eq "abandoned")
+
+    $msgs = Api "GET" "/v1/rooms/soc-room/messages?since=0&limit=0&type=goal"
+    Check "goal messages recorded" ($msgs.messages.Count -ge 4)
+    $msgs = Api "GET" "/v1/rooms/soc-room/messages?since=0&limit=0&type=gen"
+    Check "gen messages recorded" ($msgs.messages.Count -ge 4)
+    $v = Api "GET" "/v1/rooms/soc-room/verify"
+    Check "hash chain verifies with society" ($v.ok -eq $true)
+
     # --- MCP: tools/list has all tools --------------------------------------
     $env:GREENROOM_URL = $base
     $env:GREENROOM_TOKEN = $tok
@@ -168,6 +227,7 @@ try {
     Check "MCP tools/list has greenroom_task" ($toolsLine.Contains("greenroom_task"))
     Check "MCP tools/list has greenroom_wait" ($toolsLine.Contains("greenroom_wait"))
     Check "MCP tools/list has greenroom_search" ($toolsLine.Contains("greenroom_search"))
+    Check "MCP tools/list has greenroom_society" ($toolsLine.Contains("greenroom_society"))
 
     # --- MCP: task/search/wait round-trips through the proxy ----------------
     $call = '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"greenroom_task","arguments":{"action":"create","room":"it-room","title":"mcp task","agent":"eve"}}}'
@@ -185,6 +245,11 @@ try {
     $waitLine = ($mcpOut | Where-Object { $_ -match '"id":5' }) -join ""
     Check "MCP greenroom_wait timeout" ($waitLine.Contains("messages"))
 
+    $callSoc = '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"greenroom_society","arguments":{"action":"status","room":"soc-room"}}}'
+    $mcpOut = ($init + "`n" + $callSoc + "`n") | & $exe mcp
+    $socLine = ($mcpOut | Where-Object { $_ -match '"id":6' }) -join ""
+    Check "MCP greenroom_society status" ($socLine.Contains("soc-room") -and $socLine.Contains("abandoned") -and $socLine.Contains("reviewer"))
+
     # --- CLI against the token server ---------------------------------------
     $cliOut = (& $exe search "util.cpp" 2>&1) -join ""
     Check "CLI search" ($cliOut.Contains("it-room"))
@@ -194,6 +259,12 @@ try {
     Check "CLI wait timeout" ($LASTEXITCODE -eq 0)
     $cliOut = (& $exe verify it-room 2>&1) -join ""
     Check "CLI verify" ($cliOut.Contains('"ok":true'))
+    $cliOut = (& $exe goal show soc-room 2>&1) -join ""
+    Check "CLI goal show" ($cliOut.Contains("abandoned") -and $cliOut.Contains("second society"))
+    $cliOut = (& $exe gen soc-room 2>&1) -join ""
+    Check "CLI gen" ($cliOut.Contains("gen 4") -and $cliOut.Contains("retired"))
+    $cliOut = (& $exe role list soc-room 2>&1) -join ""
+    Check "CLI role list" ($cliOut.Contains("reviewer"))
 
     # --- persistence: restart serve, data survives --------------------------
     Stop-Process -Id $proc.Id -Force
@@ -204,6 +275,8 @@ try {
     Start-Sleep -Milliseconds 1500
     $list = Api "GET" "/v1/rooms/it-room/tasks"
     Check "tasks survive restart" ((($list.tasks | ForEach-Object title) -contains "fix parser bug"))
+    $s = Api "GET" "/v1/rooms/soc-room/society"
+    Check "society survives restart" ($s.goal.status -eq "abandoned" -and $s.generations.Count -eq 4)
     $v = Api "GET" "/v1/rooms/it-room/verify"
     Check "hash chain verifies after restart" ($v.ok -eq $true)
 

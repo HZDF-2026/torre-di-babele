@@ -9,16 +9,19 @@ to your LAN so your other machines can join the same room.
 **The problem it solves**: parallel sub-agents spawn, work, and die in
 isolation. One agent's findings are re-read, re-derived, and re-paid by the
 next. Two agents edit the same file and collide. greenroom gives them one
-shared place to coordinate — a blackboard, not a message bus.
+shared place to coordinate — a blackboard, not a message bus. And when a room
+declares a **god goal**, it becomes a society: mortal generations of agents
+are born, work, retire, and pass the baton — and the room does not stop until
+the goal is achieved.
 
 One binary, four faces:
 
 | face | who speaks it | what it does |
 |---|---|---|
-| `greenroom serve` | you, once per machine | HTTP server: append-only rooms, claim leases, shared blackboard, evidence-gated task board, full-text search, Web UI, SHA-256 hash chain |
-| `greenroom <cmd>` | sub-agents (shell) | say / listen / wait / claim / release / board / task / search / verify |
+| `greenroom serve` | you, once per machine | HTTP server: append-only rooms, claim leases, shared blackboard, evidence-gated task board, god-goal society (generations + roles), full-text search, Web UI, SHA-256 hash chain |
+| `greenroom <cmd>` | sub-agents (shell) | say / listen / wait / claim / release / board / task / goal / gen / role / search / verify |
 | `greenroom mcp` | the parent agent | MCP stdio server (JSON-RPC 2.0), proxies to `serve` |
-| `http://host:port/` | you, watching | built-in Web UI: live room timeline, claims, board, task board |
+| `http://host:port/` | you, watching | built-in Web UI: live room timeline, claims, board, task board, society |
 
 Full protocol, message types, claim semantics, task gate, and the sub-agent
 spawn template: [PROTOCOL.md](PROTOCOL.md).
@@ -30,11 +33,11 @@ C++17, standard library only, zero third-party dependencies.
 - **Windows 11** (MinGW-w64): `.\build.ps1` → `dist\greenroom.exe`
 - **Linux ARM64** (native g++ ≥ 9): `sh build.sh` → `dist/greenroom`
 
-Tests: `make test` runs the unit tests (73 checks: SHA-256, JSON, chain
-integrity, claim conflicts, TTL expiry, task gate, search, persistence);
-`powershell -File tests\integration.ps1` runs the end-to-end suite (36
-checks: auth, long-poll, Web UI, search, task lifecycle, MCP, CLI,
-restart persistence).
+Tests: `make test` runs the unit tests (140 checks: SHA-256, JSON, chain
+integrity, claim conflicts, TTL expiry, task gate, society lifecycle, roles,
+generations, persistence); `powershell -File tests\integration.ps1` runs the
+end-to-end suite (62 checks: auth, long-poll, Web UI, search, task
+lifecycle, society lifecycle, MCP, CLI, restart persistence).
 
 ## Quick start
 
@@ -67,6 +70,17 @@ dist\greenroom.exe task submit refactor-auth 1 "src/parser.go rewritten, tests p
 dist\greenroom.exe task verify refactor-auth 1 --agent lead        # a DIFFERENT agent
 dist\greenroom.exe task verify refactor-auth 1 --agent impl-1      # → rejected: evidence gate
 
+# the society: a god goal, generations, division of labor
+dist\greenroom.exe goal set refactor-auth "auth module refactored, all tests green" --criteria "make test passes" --agent lead
+dist\greenroom.exe gen refactor-auth                                # gen 1 active, genesis task born
+dist\greenroom.exe role take refactor-auth reviewer --agent lead     # now only reviewer/tester may verify
+dist\greenroom.exe role list refactor-auth
+# ... every task done but the goal still open? the server retires gen 1 and
+# births gen 2 automatically. Force it when a generation is stuck:
+dist\greenroom.exe gen advance refactor-auth "deadlocked on review" --agent lead
+dist\greenroom.exe goal achieve refactor-auth "test suite green, 0 failures" --agent impl-1
+dist\greenroom.exe goal verify refactor-auth --agent lead           # a DIFFERENT agent, reviewer role
+
 # search across all rooms
 dist\greenroom.exe search "retry" --room refactor-auth
 
@@ -85,9 +99,11 @@ serve runs with `--token`).
 
 `serve` embeds a single-file UI at `http://host:port/` — no build step, no
 external assets. Rooms sidebar, live message timeline (long-polled), claims
-table, blackboard table, and the task board with claim/submit/verify buttons.
-When serve runs with a token, the UI prompts for it (stored in
-localStorage) — the shell itself is always served without auth.
+table, blackboard table, the task board with claim/submit/verify buttons,
+and the **society** tab: the god goal with its status and evidence, the
+generation lineage, and the five roles with their holders. When serve runs
+with a token, the UI prompts for it (stored in localStorage) — the shell
+itself is always served without auth.
 
 ## TRAE Work integration (MCP)
 
@@ -119,7 +135,8 @@ Tools: `greenroom_protocol`, `greenroom_status`, `greenroom_rooms`,
 `greenroom_create_room`, `greenroom_say`, `greenroom_listen`,
 `greenroom_wait`, `greenroom_search`, `greenroom_claim`,
 `greenroom_release`, `greenroom_claims`, `greenroom_board_get`,
-`greenroom_board_set`, `greenroom_task`, `greenroom_verify`.
+`greenroom_board_set`, `greenroom_task`, `greenroom_society`,
+`greenroom_verify`.
 
 `greenroom_protocol` returns the sub-agent briefing (see PROTOCOL.md
 "Sub-agent briefing") — call it once, paste the text into every sub-agent
@@ -136,6 +153,7 @@ Plain files, human-readable, git-friendly:
 <datadir>/rooms/<room>/claims.json      active leases (rewritten on change)
 <datadir>/rooms/<room>/board.json      blackboard KV (rewritten on change)
 <datadir>/rooms/<room>/tasks.json       task board state (rewritten on change)
+<datadir>/rooms/<room>/society.json     god goal + generations + roles (rewritten on change)
 ```
 
 `messages.jsonl` is hash-chained (`verify` recomputes it); tampering with any

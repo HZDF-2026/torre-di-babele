@@ -106,6 +106,7 @@ Task taskFromJson(const Json& j) {
                       ? static_cast<long long>(j.get("createdTs")->num) : 0;
     t.updatedTs = j.get("updatedTs") && j.get("updatedTs")->isNum()
                       ? static_cast<long long>(j.get("updatedTs")->num) : 0;
+    t.gen = j.get("gen") && j.get("gen")->isNum() ? static_cast<int>(j.get("gen")->num) : 0;
     return t;
 }
 
@@ -121,7 +122,96 @@ Json taskToJson(const Task& t) {
     j.set("verifier", Json::string(t.verifier));
     j.set("createdTs", Json::number(static_cast<double>(t.createdTs)));
     j.set("updatedTs", Json::number(static_cast<double>(t.updatedTs)));
+    j.set("gen", Json::number(static_cast<double>(t.gen)));
     return j;
+}
+
+std::string jsonStr(const Json& j, const char* key) {
+    const Json* v = j.get(key);
+    return (v && v->isStr()) ? v->str : "";
+}
+
+long long jsonNum(const Json& j, const char* key, long long def = 0) {
+    const Json* v = j.get(key);
+    return (v && v->isNum()) ? static_cast<long long>(v->num) : def;
+}
+
+Society societyFromJson(const Json& j) {
+    Society s;
+    if (const Json* g = j.get("goal"); g && g->isObj()) {
+        s.goal.exists = true;
+        s.goal.text = jsonStr(*g, "text");
+        s.goal.criteria = jsonStr(*g, "criteria");
+        s.goal.status = jsonStr(*g, "status");
+        s.goal.proposer = jsonStr(*g, "proposer");
+        s.goal.achiever = jsonStr(*g, "achiever");
+        s.goal.evidence = jsonStr(*g, "evidence");
+        s.goal.verifier = jsonStr(*g, "verifier");
+        s.goal.createdTs = jsonNum(*g, "createdTs");
+        s.goal.closedTs = jsonNum(*g, "closedTs");
+    }
+    if (const Json* a = j.get("generations"); a && a->isArr()) {
+        for (const Json& gj : a->arr) {
+            Generation g;
+            g.n = static_cast<int>(jsonNum(gj, "n"));
+            g.status = jsonStr(gj, "status");
+            g.bornTs = jsonNum(gj, "bornTs");
+            g.retiredTs = jsonNum(gj, "retiredTs");
+            g.note = jsonStr(gj, "note");
+            s.gens.push_back(g);
+        }
+    }
+    if (const Json* a = j.get("roles"); a && a->isArr()) {
+        for (const Json& rj : a->arr) {
+            RoleEntry r;
+            r.role = jsonStr(rj, "role");
+            r.agent = jsonStr(rj, "agent");
+            r.ts = jsonNum(rj, "ts");
+            s.roles.push_back(r);
+        }
+    }
+    return s;
+}
+
+Json goalToJson(const Goal& g) {
+    Json j = Json::object();
+    j.set("exists", Json::boolean(g.exists));
+    j.set("text", Json::string(g.text));
+    j.set("criteria", Json::string(g.criteria));
+    j.set("status", Json::string(g.status));
+    j.set("proposer", Json::string(g.proposer));
+    j.set("achiever", Json::string(g.achiever));
+    j.set("evidence", Json::string(g.evidence));
+    j.set("verifier", Json::string(g.verifier));
+    j.set("createdTs", Json::number(static_cast<double>(g.createdTs)));
+    j.set("closedTs", Json::number(static_cast<double>(g.closedTs)));
+    return j;
+}
+
+Json societyToJson(const Society& s) {
+    Json obj = Json::object();
+    if (s.goal.exists) obj.set("goal", goalToJson(s.goal));
+    Json gens = Json::array();
+    for (const Generation& g : s.gens) {
+        Json gj = Json::object();
+        gj.set("n", Json::number(static_cast<double>(g.n)));
+        gj.set("status", Json::string(g.status));
+        gj.set("bornTs", Json::number(static_cast<double>(g.bornTs)));
+        gj.set("retiredTs", Json::number(static_cast<double>(g.retiredTs)));
+        gj.set("note", Json::string(g.note));
+        gens.push(std::move(gj));
+    }
+    obj.set("generations", std::move(gens));
+    Json roles = Json::array();
+    for (const RoleEntry& r : s.roles) {
+        Json rj = Json::object();
+        rj.set("role", Json::string(r.role));
+        rj.set("agent", Json::string(r.agent));
+        rj.set("ts", Json::number(static_cast<double>(r.ts)));
+        roles.push(std::move(rj));
+    }
+    obj.set("roles", std::move(roles));
+    return obj;
 }
 
 std::string asciiLower(const std::string& s) {
@@ -201,6 +291,11 @@ RoomStore::RoomData& RoomStore::load(const std::string& room) {
             for (const Json& t : j.arr) rd.tasks.push_back(taskFromJson(t));
         }
     }
+    std::string sf = pathJoin(roomDir(room), "society.json");
+    if (fileExists(sf)) {
+        Json j;
+        if (Json::parse(readBytes(sf), j) && j.isObj()) rd.soc = societyFromJson(j);
+    }
     long long maxClaimId = 0;
     for (const Claim& c : rd.claims) maxClaimId = std::max(maxClaimId, c.id);
     rd.nextClaimId = maxClaimId + 1;
@@ -236,7 +331,8 @@ Message RoomStore::sayLocked(const std::string& room, const std::string& agent,
                              const std::string& type, const std::string& content,
                              long long ref) {
     static const char* types[] = {"say", "plan", "fact", "ask", "answer",
-                                  "claim", "release", "veto", "done", "task", nullptr};
+                                  "claim", "release", "veto", "done", "task",
+                                  "goal", "gen", "role", nullptr};
     bool okType = false;
     for (int i = 0; types[i]; i++)
         if (type == types[i]) okType = true;
@@ -323,19 +419,15 @@ Task* RoomStore::findTask(RoomData& rd, long long id) {
     return nullptr;
 }
 
-Task RoomStore::taskCreate(const std::string& room, const std::string& title,
-                           const std::string& detail, const std::string& creator) {
-    std::lock_guard<std::mutex> lock(mu_);
-    if (title.empty() || title.size() > 512) throw std::runtime_error("bad task title");
-    if (detail.size() > 4096) throw std::runtime_error("detail too long (max 4096)");
-    if (creator.empty() || creator.size() > 64) throw std::runtime_error("bad agent name");
-    RoomData& rd = load(room);
+Task RoomStore::createTaskLocked(const std::string& room, RoomData& rd, const std::string& title,
+                                 const std::string& detail, const std::string& creator, int gen) {
     Task t;
     t.id = rd.nextTaskId++;
     t.title = title;
     t.detail = detail;
     t.status = "open";
     t.creator = creator;
+    t.gen = gen;
     t.createdTs = nowMs();
     t.updatedTs = t.createdTs;
     rd.tasks.push_back(t);
@@ -344,6 +436,16 @@ Task RoomStore::taskCreate(const std::string& room, const std::string& title,
               "task #" + std::to_string(t.id) + " \"" + title + "\" created by " + creator,
               -1);
     return t;
+}
+
+Task RoomStore::taskCreate(const std::string& room, const std::string& title,
+                           const std::string& detail, const std::string& creator) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (title.empty() || title.size() > 512) throw std::runtime_error("bad task title");
+    if (detail.size() > 4096) throw std::runtime_error("detail too long (max 4096)");
+    if (creator.empty() || creator.size() > 64) throw std::runtime_error("bad agent name");
+    RoomData& rd = load(room);
+    return createTaskLocked(room, rd, title, detail, creator, currentGenLocked(rd));
 }
 
 std::vector<Task> RoomStore::tasks(const std::string& room) {
@@ -407,6 +509,12 @@ Task RoomStore::taskVerify(const std::string& room, long long id, const std::str
     if (agent == t->assignee)
         throw std::runtime_error("task #" + std::to_string(id) +
                                   " cannot be verified by its own assignee — evidence gate");
+    // The division-of-labor gate: once roles are registered, only the
+    // reviewer and tester roles may verify.
+    if (!rd.soc.roles.empty() && !hasVerifyRoleLocked(rd, agent))
+        throw std::runtime_error("task #" + std::to_string(id) +
+                                  " verification requires the reviewer or tester role while "
+                                  "roles are registered");
     t->verifier = agent;
     t->updatedTs = nowMs();
     if (accept) {
@@ -416,16 +524,19 @@ Task RoomStore::taskVerify(const std::string& room, long long id, const std::str
                   "task #" + std::to_string(id) + " \"" + t->title +
                       "\" verified DONE by " + agent,
                   -1);
-    } else {
-        t->status = "open";
-        t->assignee.clear();
-        t->evidence.clear();
-        persistTasks(room, rd);
-        sayLocked(room, "server", "task",
-                  "task #" + std::to_string(id) + " \"" + t->title + "\" rejected by " + agent +
-                      " — reopened",
-                  -1);
+        Task out = *t;  // copy before the drain check may grow the vector
+        // A drained generation with the goal still open births the next one.
+        checkGenDrainLocked(room, rd);
+        return out;
     }
+    t->status = "open";
+    t->assignee.clear();
+    t->evidence.clear();
+    persistTasks(room, rd);
+    sayLocked(room, "server", "task",
+              "task #" + std::to_string(id) + " \"" + t->title + "\" rejected by " + agent +
+                  " — reopened",
+              -1);
     return *t;
 }
 
@@ -623,6 +734,218 @@ bool RoomStore::verify(const std::string& room, std::string& errOut) {
     }
     return true;
 }
+
+// ---- society layer ---------------------------------------------------------
+
+Society RoomStore::society(const std::string& room) {
+    std::lock_guard<std::mutex> lock(mu_);
+    RoomData& rd = load(room);
+    return rd.soc;
+}
+
+int RoomStore::currentGenLocked(const RoomData& rd) const {
+    if (rd.soc.gens.empty() || rd.soc.gens.back().status != "active") return 0;
+    return rd.soc.gens.back().n;
+}
+
+bool RoomStore::hasVerifyRoleLocked(const RoomData& rd, const std::string& agent) const {
+    for (const RoleEntry& r : rd.soc.roles)
+        if (r.agent == agent && (r.role == "reviewer" || r.role == "tester")) return true;
+    return false;
+}
+
+void RoomStore::persistSociety(const std::string& room, RoomData& rd) {
+    writeBytes(pathJoin(roomDir(room), "society.json"), societyToJson(rd.soc).dump() + "\n");
+}
+
+void RoomStore::retireGenLocked(const std::string& room, RoomData& rd, const std::string& note) {
+    if (rd.soc.gens.empty() || rd.soc.gens.back().status != "active") return;
+    Generation& g = rd.soc.gens.back();
+    g.status = "retired";
+    g.retiredTs = nowMs();
+    g.note = note;
+    persistSociety(room, rd);
+    sayLocked(room, "server", "gen",
+              "generation " + std::to_string(g.n) + " retired — " + note, -1);
+}
+
+void RoomStore::birthGenLocked(const std::string& room, RoomData& rd) {
+    int n = rd.soc.gens.empty() ? 1 : rd.soc.gens.back().n + 1;
+    Generation g;
+    g.n = n;
+    g.status = "active";
+    g.bornTs = nowMs();
+    rd.soc.gens.push_back(g);
+    persistSociety(room, rd);
+    // The genesis task: the new generation's ritual entry point. It keeps
+    // every generation's board non-empty, so birth can never loop.
+    createTaskLocked(room, rd,
+                     "Generation " + std::to_string(n) + ": assess and plan",
+                     "The god goal is still open. Read the full room history "
+                     "(listen --since 0), assess the gap, then create and "
+                     "distribute this generation's tasks.",
+                     "server", n);
+    sayLocked(room, "server", "gen",
+              "generation " + std::to_string(n) + " born — the god goal is still open", -1);
+}
+
+void RoomStore::checkGenDrainLocked(const std::string& room, RoomData& rd) {
+    if (!rd.soc.goal.exists || rd.soc.goal.status != "open") return;
+    if (rd.soc.gens.empty() || rd.soc.gens.back().status != "active") return;
+    int cur = rd.soc.gens.back().n;
+    for (const Task& t : rd.tasks)
+        if (t.gen == cur && t.status != "done") return;  // work remains
+    retireGenLocked(room, rd, "task board drained");
+    birthGenLocked(room, rd);
+}
+
+void RoomStore::goalSet(const std::string& room, const std::string& text,
+                        const std::string& criteria, const std::string& agent) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (text.empty() || text.size() > 2048) throw std::runtime_error("bad goal text (1..2048)");
+    if (criteria.size() > 2048) throw std::runtime_error("criteria too long (max 2048)");
+    if (agent.empty() || agent.size() > 64) throw std::runtime_error("bad agent name");
+    RoomData& rd = load(room);
+    if (rd.soc.goal.exists &&
+        (rd.soc.goal.status == "open" || rd.soc.goal.status == "proposed"))
+        throw std::runtime_error("a god goal is already active — achieve, verify or abandon it "
+                                 "first");
+    rd.soc.goal = Goal{};
+    rd.soc.goal.exists = true;
+    rd.soc.goal.text = text;
+    rd.soc.goal.criteria = criteria;
+    rd.soc.goal.status = "open";
+    rd.soc.goal.proposer = agent;
+    rd.soc.goal.createdTs = nowMs();
+    // Generations are NOT reset here: numbering stays monotonic over the
+    // room's whole lifetime, so tasks left over from an old society (gen n)
+    // can never be conflated with a new society's generations (gen > n).
+    persistSociety(room, rd);
+    sayLocked(room, "server", "goal",
+              "god goal declared by " + agent + ": \"" + text + "\"" +
+                  (criteria.empty() ? "" : " (criteria: " + criteria + ")") +
+                  " — society born",
+              -1);
+    birthGenLocked(room, rd);
+}
+
+void RoomStore::goalAchieve(const std::string& room, const std::string& agent,
+                            const std::string& evidence) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (agent.empty() || agent.size() > 64) throw std::runtime_error("bad agent name");
+    if (evidence.empty()) throw std::runtime_error("evidence required to claim achievement");
+    if (evidence.size() > 4096) throw std::runtime_error("evidence too long (max 4096)");
+    RoomData& rd = load(room);
+    if (!rd.soc.goal.exists) throw std::runtime_error("no god goal declared");
+    if (rd.soc.goal.status != "open")
+        throw std::runtime_error("goal is not open (status: " + rd.soc.goal.status + ")");
+    rd.soc.goal.status = "proposed";
+    rd.soc.goal.achiever = agent;
+    rd.soc.goal.evidence = evidence;
+    persistSociety(room, rd);
+    std::string ev = evidence.size() > 200 ? evidence.substr(0, 200) + "…" : evidence;
+    sayLocked(room, "server", "goal",
+              agent + " proposed god-goal achievement: " + ev, -1);
+}
+
+void RoomStore::goalVerify(const std::string& room, const std::string& agent, bool accept) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (agent.empty() || agent.size() > 64) throw std::runtime_error("bad agent name");
+    RoomData& rd = load(room);
+    if (!rd.soc.goal.exists) throw std::runtime_error("no god goal declared");
+    if (rd.soc.goal.status != "proposed")
+        throw std::runtime_error("goal is not proposed (status: " + rd.soc.goal.status + ")");
+    if (agent == rd.soc.goal.achiever)
+        throw std::runtime_error("the god goal cannot be verified by its own achiever — "
+                                 "evidence gate");
+    if (!rd.soc.roles.empty() && !hasVerifyRoleLocked(rd, agent))
+        throw std::runtime_error("god-goal verification requires the reviewer or tester role "
+                                 "while roles are registered");
+    Goal& g = rd.soc.goal;
+    if (accept) {
+        g.status = "achieved";
+        g.verifier = agent;
+        g.closedTs = nowMs();
+        persistSociety(room, rd);
+        retireGenLocked(room, rd, "god goal achieved");
+        sayLocked(room, "server", "goal",
+                  "god goal ACHIEVED — verified by " + agent + ", society closed after " +
+                      std::to_string(rd.soc.gens.size()) + " generation(s)",
+                  -1);
+    } else {
+        g.status = "open";
+        g.achiever.clear();
+        g.evidence.clear();
+        persistSociety(room, rd);
+        sayLocked(room, "server", "goal",
+                  "achievement claim rejected by " + agent + " — goal reopened", -1);
+        // The board may have drained while the claim was pending.
+        checkGenDrainLocked(room, rd);
+    }
+}
+
+void RoomStore::goalAbandon(const std::string& room, const std::string& agent,
+                            const std::string& reason) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (agent.empty() || agent.size() > 64) throw std::runtime_error("bad agent name");
+    if (reason.size() > 2048) throw std::runtime_error("reason too long (max 2048)");
+    RoomData& rd = load(room);
+    if (!rd.soc.goal.exists) throw std::runtime_error("no god goal declared");
+    if (rd.soc.goal.status == "achieved" || rd.soc.goal.status == "abandoned")
+        throw std::runtime_error("society is already closed (status: " + rd.soc.goal.status +
+                                 ")");
+    rd.soc.goal.status = "abandoned";
+    rd.soc.goal.closedTs = nowMs();
+    persistSociety(room, rd);
+    retireGenLocked(room, rd, "god goal abandoned");
+    sayLocked(room, "server", "goal",
+              "god goal abandoned by " + agent +
+                  (reason.empty() ? "" : ": " + reason) + " — society closed",
+              -1);
+}
+
+void RoomStore::genAdvance(const std::string& room, const std::string& agent,
+                           const std::string& note) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (agent.empty() || agent.size() > 64) throw std::runtime_error("bad agent name");
+    if (note.size() > 2048) throw std::runtime_error("note too long (max 2048)");
+    RoomData& rd = load(room);
+    if (!rd.soc.goal.exists) throw std::runtime_error("no god goal declared");
+    if (rd.soc.goal.status == "achieved" || rd.soc.goal.status == "abandoned")
+        throw std::runtime_error("society is closed (status: " + rd.soc.goal.status + ")");
+    if (rd.soc.goal.status == "proposed")
+        throw std::runtime_error("achievement proposal pending verification");
+    if (rd.soc.gens.empty() || rd.soc.gens.back().status != "active")
+        throw std::runtime_error("no active generation");
+    retireGenLocked(room, rd, "forced by " + agent + (note.empty() ? "" : ": " + note));
+    birthGenLocked(room, rd);
+}
+
+void RoomStore::roleTake(const std::string& room, const std::string& agent,
+                         const std::string& role) {
+    static const char* roles[] = {"commander", "recorder", "executor", "reviewer", "tester",
+                                  nullptr};
+    std::lock_guard<std::mutex> lock(mu_);
+    if (agent.empty() || agent.size() > 64) throw std::runtime_error("bad agent name");
+    bool ok = false;
+    for (int i = 0; roles[i]; i++)
+        if (role == roles[i]) ok = true;
+    if (!ok)
+        throw std::runtime_error("unknown role: " + role +
+                                 " (commander|recorder|executor|reviewer|tester)");
+    RoomData& rd = load(room);
+    for (const RoleEntry& r : rd.soc.roles)
+        if (r.role == role && r.agent == agent) return;  // idempotent
+    RoleEntry r;
+    r.role = role;
+    r.agent = agent;
+    r.ts = nowMs();
+    rd.soc.roles.push_back(r);
+    persistSociety(room, rd);
+    sayLocked(room, "server", "role", agent + " took role " + role, -1);
+}
+
+// -----------------------------------------------------------------------------
 
 std::vector<std::string> RoomStore::rooms() {
     std::vector<std::string> out;

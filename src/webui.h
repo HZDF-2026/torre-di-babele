@@ -48,6 +48,9 @@ header button:hover{border-color:var(--accent)}
 .t-plan{color:var(--accent2)}.t-claim{color:var(--warn)}.t-release{color:var(--dim)}
 .t-veto{color:var(--bad);border-color:var(--bad)!important}.t-done{color:var(--accent)}
 .t-task{color:var(--accent2);border-color:var(--accent2)!important}
+.t-goal{color:var(--warn);border-color:var(--warn)!important}
+.t-gen{color:var(--accent);border-color:var(--accent)!important}
+.t-role{color:var(--dim)}
 .msg .mcontent{flex:1;white-space:pre-wrap;word-break:break-word}
 .msg .mref{color:var(--dim);font-size:11px}
 table{border-collapse:collapse;width:100%}
@@ -66,6 +69,19 @@ button.act:hover{border-color:var(--accent)}
 .evi{color:var(--dim);font-size:12px;margin-top:4px;white-space:pre-wrap}
 #newtask{display:flex;gap:6px;margin-bottom:12px}
 #newtask input{flex:1;background:var(--panel2);border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:6px 10px;font:12px var(--mono)}
+.goalbox{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin-bottom:14px}
+.goalbox .gtext{font-size:15px}
+.gs-open{color:var(--warn);border:1px solid var(--warn)}
+.gs-proposed{color:var(--accent2);border:1px solid var(--accent2)}
+.gs-achieved{color:var(--accent);border:1px solid var(--accent)}
+.gs-abandoned{color:var(--bad);border:1px solid var(--bad)}
+.gchip{font-size:10px;color:var(--dim);border:1px solid var(--line);border-radius:4px;padding:0 5px;margin-left:6px}
+#newgoal{display:flex;gap:6px;margin-bottom:14px}
+#newgoal input{background:var(--panel2);border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:6px 10px;font:12px var(--mono)}
+#newgoal input:first-child{flex:1}
+.roletag{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:2px 8px;margin:2px;font-size:12px}
+.roletag b{color:var(--accent2)}
+h3.sec{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin:14px 0 6px}
 </style>
 </head>
 <body>
@@ -89,6 +105,7 @@ button.act:hover{border-color:var(--accent)}
       <div class="tab" data-tab="claims">claims</div>
       <div class="tab" data-tab="board">board</div>
       <div class="tab" data-tab="tasks">tasks</div>
+      <div class="tab" data-tab="society">society</div>
       <span style="flex:1"></span>
       <div class="tab" id="chainTab" title="Verify the SHA-256 chain">verify</div>
     </div>
@@ -204,6 +221,8 @@ async function refreshTab(){
     c.innerHTML = `<div id="newtask"><input id="nt" placeholder="new task title…">`+
       `<button class="act" onclick="addTask()">add</button></div>`+
       (ts.length ? ts.map(t=>taskRow(t)).join("") : `<div class="empty">no tasks</div>`);
+  }else if(tab === "society"){
+    renderSociety(await api(`/v1/rooms/${cur}/society`));
   }
 }
 function taskRow(t){
@@ -215,6 +234,7 @@ function taskRow(t){
     `<button class="act" onclick="taskAct(${t.id},'verify',false)">reject</button>`);
   return `<div class="msg" style="display:block;padding:10px 8px">
     <div><span class="mid">#${t.id}</span> <span class="badge s-${t.status}">${t.status}</span>
+      ${t.gen?`<span class="gchip">gen ${t.gen}</span>`:""}
       <b style="margin-left:8px">${esc(t.title)}</b>
       ${t.assignee?`<span style="color:var(--accent2);margin-left:8px">@${esc(t.assignee)}</span>`:""}
       <span style="float:right">${btns.join(" ")}</span></div>
@@ -227,6 +247,99 @@ async function addTask(){
   if(!t) return;
   await api(`/v1/rooms/${cur}/tasks`, {method:"POST", body:JSON.stringify({title:t, agent:me()})});
   refreshTab();
+}
+const ROLES = ["commander","recorder","executor","reviewer","tester"];
+function renderSociety(s){
+  const c = $("#content");
+  const g = s.goal || {};
+  let html = "";
+  if(g.exists){
+    const btns = [];
+    if(g.status==="open"){
+      btns.push(`<button class="act" onclick="goalAct('achieve')">claim achievement</button>`);
+      btns.push(`<button class="act" onclick="goalAct('abandon')">abandon</button>`);
+    }else if(g.status==="proposed"){
+      btns.push(`<button class="act" onclick="goalAct('accept')">verify ✓</button>`);
+      btns.push(`<button class="act" onclick="goalAct('reject')">verify ✗</button>`);
+    }
+    html += `<div class="goalbox">
+      <div style="margin-bottom:6px"><span class="badge gs-${g.status}">${g.status}</span>
+        <span class="gchip">declared by ${esc(g.proposer||"?")} · ${fmt(g.createdTs)}</span></div>
+      <div class="gtext">${esc(g.text)}</div>
+      ${g.criteria?`<div class="evi">criteria: ${esc(g.criteria)}</div>`:""}
+      ${g.status==="proposed"?`<div class="evi" style="color:var(--accent2)">achievement claimed by ${esc(g.achiever)} — evidence: ${esc(g.evidence)}</div>`:""}
+      ${g.verifier?`<div class="evi">closed by ${esc(g.verifier)} at ${fmt(g.closedTs)}</div>`:""}
+      ${btns.length?`<div style="margin-top:8px">${btns.join(" ")}</div>`:""}
+    </div>`;
+  }else{
+    html += `<div id="newgoal">
+      <input id="gt" placeholder="declare the god goal of this society…">
+      <input id="gc" placeholder="criteria (optional)">
+      <button class="act" onclick="goalSet()">set</button>
+    </div>
+    <div class="empty">no god goal — this room is a plain collaboration board</div>`;
+  }
+  const gens = s.generations || [];
+  html += `<h3 class="sec">generations${s.generation?` — current: gen ${s.generation}`:""}</h3>`;
+  html += gens.length ? `<table><tr><th>#</th><th>status</th><th>born</th><th>retired</th><th>note</th></tr>`+
+    gens.slice().reverse().map(x=>`<tr><td>${x.n}</td><td>${x.status}</td>`+
+      `<td>${fmt(x.bornTs)}</td><td>${x.retiredTs?fmt(x.retiredTs):"—"}</td><td>${esc(x.note||"")}</td></tr>`).join("")+`</table>`
+    : `<div class="empty">no generations — declare a god goal to birth gen 1</div>`;
+  if(g.exists && g.status==="open")
+    html += `<div style="margin-top:8px"><button class="act" onclick="genAdvance()">force next generation</button></div>`;
+  const roles = s.roles || [];
+  html += `<h3 class="sec">roles — division of labor</h3><div>`+
+    ROLES.map(r=>{
+      const holders = roles.filter(x=>x.role===r).map(x=>x.agent);
+      return `<span class="roletag"><b>${r}</b>: ${holders.length?esc(holders.join(", ")):"—"}</span>`;
+    }).join("")+`</div>`;
+  html += `<div style="margin-top:8px">
+    <select id="rr" style="background:var(--panel2);border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:5px 8px;font:12px var(--mono)">
+      ${ROLES.map(r=>`<option>${r}</option>`).join("")}
+    </select>
+    <button class="act" onclick="roleTake()">take role as ${esc(me())}</button>
+    ${roles.length?`<span class="evi" style="display:inline;margin-left:8px">while roles are registered, only reviewer/tester may verify</span>`:""}
+  </div>`;
+  c.innerHTML = html;
+}
+async function goalSet(){
+  const t = $("#gt").value.trim();
+  if(!t){ alert("goal text required"); return; }
+  try{
+    await api(`/v1/rooms/${cur}/goal`, {method:"POST",
+      body:JSON.stringify({text:t, criteria:$("#gc").value.trim(), agent:me()})});
+    refreshTab();
+  }catch(e){ if(String(e.message)!=="401") alert(e.message||"failed"); }
+}
+async function goalAct(action){
+  try{
+    if(action==="achieve"){
+      const ev = prompt("evidence (what proves the god goal is achieved):");
+      if(ev==null) return;
+      await api(`/v1/rooms/${cur}/goal/achieve`, {method:"POST", body:JSON.stringify({agent:me(), evidence:ev})});
+    }else if(action==="abandon"){
+      const r = prompt("why abandon the god goal?");
+      if(r==null) return;
+      await api(`/v1/rooms/${cur}/goal/abandon`, {method:"POST", body:JSON.stringify({agent:me(), reason:r})});
+    }else{
+      await api(`/v1/rooms/${cur}/goal/verify`, {method:"POST", body:JSON.stringify({agent:me(), accept:action==="accept"})});
+    }
+    refreshTab();
+  }catch(e){ if(String(e.message)!=="401") alert(e.message||"failed"); }
+}
+async function genAdvance(){
+  const note = prompt("note (why force the next generation):");
+  if(note==null) return;
+  try{
+    await api(`/v1/rooms/${cur}/gen/advance`, {method:"POST", body:JSON.stringify({agent:me(), note})});
+    refreshTab();
+  }catch(e){ if(String(e.message)!=="401") alert(e.message||"failed"); }
+}
+async function roleTake(){
+  try{
+    await api(`/v1/rooms/${cur}/roles`, {method:"POST", body:JSON.stringify({agent:me(), role:$("#rr").value})});
+    refreshTab();
+  }catch(e){ if(String(e.message)!=="401") alert(e.message||"failed"); }
 }
 async function taskAct(id, action, accept){
   try{
