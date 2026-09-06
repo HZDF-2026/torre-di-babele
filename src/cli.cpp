@@ -2,6 +2,7 @@
 #include "cli.h"
 
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <thread>
 
@@ -22,8 +23,12 @@ void usage() {
               << "usage:\n"
               << "  greenroom serve  [--port 7788] [--data DIR] [--bind 127.0.0.1] [--token S]\n"
               << "  greenroom status\n"
+              << "  greenroom agent  register NAME --key KEY\n"
+              << "  greenroom agent  list\n"
               << "  greenroom rooms\n"
-              << "  greenroom create ROOM\n"
+              << "  greenroom create ROOM [--chamber]      (chamber needs --agent + --key)\n"
+              << "  greenroom member list ROOM\n"
+              << "  greenroom member add ROOM AGENT        (caller: --agent + --key, member only)\n"
               << "  greenroom say    ROOM TYPE CONTENT [--agent A] [--ref N]\n"
               << "  greenroom listen ROOM [--since N] [--limit M] [--follow] [--agent A]\n"
               << "  greenroom wait   ROOM [--since N] [--timeout-ms 30000]\n"
@@ -38,6 +43,10 @@ void usage() {
               << "  greenroom task claim ROOM ID [--agent A]\n"
               << "  greenroom task submit ROOM ID EVIDENCE... [--agent A]\n"
               << "  greenroom task verify ROOM ID [--agent A] [--reject]\n"
+              << "  greenroom post   define ROOM NAME [--verify-task] [--verify-goal] [--model M]\n"
+              << "  greenroom post   list ROOM\n"
+              << "  greenroom population ROOM\n"
+              << "  greenroom report  ROOM [--mode hzdf|company|feudal]\n"
               << "  greenroom goal  set ROOM TEXT... [--criteria C] [--oracle URL] [--agent A]\n"
               << "  greenroom goal  show ROOM\n"
               << "  greenroom goal  achieve ROOM EVIDENCE... [--agent A]\n"
@@ -52,10 +61,11 @@ void usage() {
               << "  greenroom mcp\n"
               << "\n"
               << "types: say plan fact ask answer done task goal gen role\n"
-              << "roles: commander recorder executor reviewer tester\n"
+              << "posts: commander recorder executor reviewer tester + custom (post define)\n"
               << "env:   GREENROOM_URL (default http://127.0.0.1:7788)\n"
               << "       GREENROOM_TOKEN (Bearer token when serve runs with --token)\n"
               << "       GREENROOM_AGENT (default --agent, else 'anon')\n"
+              << "       GREENROOM_KEY (identity key; pairs with --agent for chambers)\n"
               << "see PROTOCOL.md for the full protocol.\n";
 }
 
@@ -184,16 +194,24 @@ void printMsg(const Json& m) {
               << content << "\n";
 }
 
+// Identity headers for this invocation (set once in runCli from --key /
+// GREENROOM_KEY + the agent name). Sent on every request; the server only
+// honors them for chambers and agent registration.
+std::map<std::string, std::string> gIdentity;
+
 ClientResult httpGet(const Target& t, const std::string& target) {
-    return httpClient(t.host, t.port, "GET", target, "", envOr("GREENROOM_TOKEN", ""));
+    return httpClient(t.host, t.port, "GET", target, "", envOr("GREENROOM_TOKEN", ""), 0,
+                      gIdentity);
 }
 
 ClientResult httpPost(const Target& t, const std::string& target, const std::string& body) {
-    return httpClient(t.host, t.port, "POST", target, body, envOr("GREENROOM_TOKEN", ""));
+    return httpClient(t.host, t.port, "POST", target, body, envOr("GREENROOM_TOKEN", ""), 0,
+                      gIdentity);
 }
 
 ClientResult httpPut(const Target& t, const std::string& target, const std::string& body) {
-    return httpClient(t.host, t.port, "PUT", target, body, envOr("GREENROOM_TOKEN", ""));
+    return httpClient(t.host, t.port, "PUT", target, body, envOr("GREENROOM_TOKEN", ""), 0,
+                      gIdentity);
 }
 
 int cmdServe(const Parsed& p) {
@@ -298,9 +316,21 @@ int runCli(const std::vector<std::string>& args) {
         Parsed p;
         if (!parseArgs(rest, p, {"port", "data", "bind", "token", "agent", "ref", "since",
                                  "limit", "ttl", "id", "scope", "timeout-ms", "detail", "room",
-                                 "criteria", "oracle"}))
+                                 "criteria", "oracle", "key", "model", "mode"}))
             return 1;
         if (cmd == "serve") return cmdServe(p);
+
+        // Identity headers for this invocation: --key (or GREENROOM_KEY)
+        // paired with the agent name. The server verifies both against the
+        // registry; chambers refuse requests without them.
+        {
+            std::string key = flag(p, "key");
+            if (key.empty()) key = envOr("GREENROOM_KEY", "");
+            if (!key.empty()) {
+                gIdentity["X-GR-Agent"] = defaultAgent(p);
+                gIdentity["X-GR-Key"] = key;
+            }
+        }
 
         // Remote commands.
         Target t = parseTarget();
@@ -309,6 +339,45 @@ int runCli(const std::vector<std::string>& args) {
             if (!r.ok) return fail(r);
             std::cout << r.body << "\n";
             return 0;
+        }
+        if (cmd == "agent") {
+            if (p.pos.empty()) {
+                std::cerr << "error: agent register|list ...\n";
+                return 1;
+            }
+            std::string action = p.pos[0];
+            if (action == "register") {
+                if (p.pos.size() < 2) {
+                    std::cerr << "error: agent register needs NAME --key KEY\n";
+                    return 1;
+                }
+                std::string key = flag(p, "key");
+                if (key.empty()) key = envOr("GREENROOM_KEY", "");
+                if (key.empty()) {
+                    std::cerr << "error: agent register needs --key KEY (8..128 chars)\n";
+                    return 1;
+                }
+                Json body = Json::object();
+                body.set("name", Json::string(p.pos[1]));
+                body.set("key", Json::string(key));
+                ClientResult r = httpPost(t, "/v1/agents", body.dump());
+                if (!r.ok) return fail(r);
+                std::cout << "registered " << p.pos[1]
+                          << " (key hashed with SHA-256, never stored — keep it safe)\n";
+                return 0;
+            }
+            if (action == "list") {
+                ClientResult r = httpGet(t, "/v1/agents");
+                if (!r.ok) return fail(r);
+                Json body;
+                if (Json::parse(r.body, body) && body.get("agents") &&
+                    body.get("agents")->isArr()) {
+                    for (const Json& a : body.get("agents")->arr) std::cout << a.str << "\n";
+                }
+                return 0;
+            }
+            std::cerr << "error: agent register|list ...\n";
+            return 1;
         }
         if (cmd == "rooms") {
             ClientResult r = httpGet(t, "/v1/rooms");
@@ -326,9 +395,138 @@ int runCli(const std::vector<std::string>& args) {
             }
             Json body = Json::object();
             body.set("name", Json::string(p.pos[0]));
+            if (hasFlag(p, "chamber")) {
+                body.set("chamber", Json::boolean(true));
+                if (gIdentity.empty()) {
+                    std::cerr << "error: --chamber needs a registered identity "
+                                 "(--agent NAME --key KEY)\n";
+                    return 1;
+                }
+            }
             ClientResult r = httpPost(t, "/v1/rooms", body.dump());
             if (!r.ok) return fail(r);
-            std::cout << "created " << p.pos[0] << "\n";
+            std::cout << "created " << p.pos[0]
+                      << (hasFlag(p, "chamber") ? " (chamber)" : "") << "\n";
+            return 0;
+        }
+        if (cmd == "member") {
+            if (p.pos.size() < 2) {
+                std::cerr << "error: member add ROOM AGENT | member list ROOM\n";
+                return 1;
+            }
+            std::string action = p.pos[0];
+            if (action == "list") {
+                ClientResult r = httpGet(t, "/v1/rooms/" + urlEnc(p.pos[1]) + "/members");
+                if (!r.ok) return fail(r);
+                Json body;
+                if (Json::parse(r.body, body) && body.get("members") &&
+                    body.get("members")->isArr()) {
+                    for (const Json& a : body.get("members")->arr) std::cout << a.str << "\n";
+                }
+                return 0;
+            }
+            if (action == "add") {
+                if (p.pos.size() < 3) {
+                    std::cerr << "error: member add needs ROOM AGENT\n";
+                    return 1;
+                }
+                if (gIdentity.empty()) {
+                    std::cerr << "error: member add needs a registered caller "
+                                 "(--agent NAME --key KEY)\n";
+                    return 1;
+                }
+                Json body = Json::object();
+                body.set("agent", Json::string(p.pos[2]));
+                ClientResult r = httpPost(t, "/v1/rooms/" + urlEnc(p.pos[1]) + "/members",
+                                          body.dump());
+                if (!r.ok) return fail(r);
+                std::cout << "added " << p.pos[2] << " to " << p.pos[1] << "\n";
+                return 0;
+            }
+            std::cerr << "error: member add|list ...\n";
+            return 1;
+        }
+        if (cmd == "post") {
+            if (p.pos.size() < 2) {
+                std::cerr << "error: post define ROOM NAME [--verify-task] [--verify-goal] "
+                             "[--model M] | post list ROOM\n";
+                return 1;
+            }
+            std::string action = p.pos[0];
+            if (action == "list") {
+                ClientResult r = httpGet(t, "/v1/rooms/" + urlEnc(p.pos[1]) + "/posts");
+                if (!r.ok) return fail(r);
+                Json body;
+                if (Json::parse(r.body, body) && body.get("posts") &&
+                    body.get("posts")->isArr()) {
+                    for (const Json& pj : body.get("posts")->arr) {
+                        std::string name = pj.get("name") ? pj.get("name")->str : "?";
+                        bool vt = pj.get("canVerifyTask") && pj.get("canVerifyTask")->isBool() &&
+                                  pj.get("canVerifyTask")->b;
+                        bool vg = pj.get("canVerifyGoal") && pj.get("canVerifyGoal")->isBool() &&
+                                  pj.get("canVerifyGoal")->b;
+                        std::string model = pj.get("model") ? pj.get("model")->str : "";
+                        bool preset = pj.get("preset") && pj.get("preset")->isBool() &&
+                                      pj.get("preset")->b;
+                        std::cout << name << (preset ? " (preset)" : "") << "  verify-task: "
+                                  << (vt ? "yes" : "no") << "  verify-goal: "
+                                  << (vg ? "yes" : "no")
+                                  << (model.empty() ? "" : "  model: " + model) << "\n";
+                    }
+                }
+                return 0;
+            }
+            if (action == "define") {
+                if (p.pos.size() < 3) {
+                    std::cerr << "error: post define needs ROOM NAME\n";
+                    return 1;
+                }
+                Json body = Json::object();
+                body.set("name", Json::string(p.pos[2]));
+                body.set("agent", Json::string(defaultAgent(p)));
+                if (hasFlag(p, "verify-task")) body.set("canVerifyTask", Json::boolean(true));
+                if (hasFlag(p, "verify-goal")) body.set("canVerifyGoal", Json::boolean(true));
+                std::string model = flag(p, "model");
+                if (!model.empty()) body.set("model", Json::string(model));
+                ClientResult r = httpPost(t, "/v1/rooms/" + urlEnc(p.pos[1]) + "/posts",
+                                          body.dump());
+                if (!r.ok) return fail(r);
+                std::cout << "defined post " << p.pos[2] << " in " << p.pos[1] << "\n";
+                return 0;
+            }
+            std::cerr << "error: post define|list ...\n";
+            return 1;
+        }
+        if (cmd == "population") {
+            if (p.pos.empty()) {
+                std::cerr << "error: population needs ROOM\n";
+                return 1;
+            }
+            ClientResult r = httpGet(t, "/v1/rooms/" + urlEnc(p.pos[0]) + "/population");
+            if (!r.ok) return fail(r);
+            Json body;
+            if (Json::parse(r.body, body) && body.get("activeAgents") &&
+                body.get("activeAgents")->isArr()) {
+                std::cout << "active (" << body.get("activeAgents")->arr.size() << "):";
+                for (const Json& a : body.get("activeAgents")->arr)
+                    std::cout << " " << a.str;
+                std::cout << "\n(parent loop: keep 5-10 active, replenish below 3)\n";
+            }
+            return 0;
+        }
+        if (cmd == "report") {
+            if (p.pos.empty()) {
+                std::cerr << "error: report needs ROOM [--mode hzdf|company|feudal]\n";
+                return 1;
+            }
+            std::string mode = flag(p, "mode");
+            if (mode.empty()) mode = "hzdf";
+            ClientResult r = httpGet(t, "/v1/rooms/" + urlEnc(p.pos[0]) +
+                                          "/report?mode=" + urlEnc(mode));
+            if (!r.ok) return fail(r);
+            Json body;
+            if (Json::parse(r.body, body) && body.get("report"))
+                std::cout << body.get("report")->str << "\n";
             return 0;
         }
         if (cmd == "say") {

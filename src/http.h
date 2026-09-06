@@ -51,9 +51,11 @@ struct ClientResult {
 // bearer: when non-empty, sent as "Authorization: Bearer <bearer>".
 // timeoutMs: when > 0, send/recv socket timeouts in milliseconds (0 = block
 // forever; the CLI long-poll relies on the default).
+// extraHeaders: sent verbatim (agent identity headers etc.).
 ClientResult httpClient(const std::string& host, int port, const std::string& method,
                         const std::string& rawTarget, const std::string& body,
-                        const std::string& bearer = "", long long timeoutMs = 0);
+                        const std::string& bearer = "", long long timeoutMs = 0,
+                        const std::map<std::string, std::string>& extraHeaders = {});
 
 // One-shot socket layer init (Win: WSAStartup). Safe to call repeatedly.
 bool netInit(std::string& errOut);

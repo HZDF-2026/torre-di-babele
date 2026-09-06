@@ -382,7 +382,7 @@ static void testSocietyRoles() {
     threw = false;
     try { st.taskVerify("t", 1, "a4", true); } catch (const std::exception& e) {
         threw = true;
-        CHECK(std::string(e.what()).find("reviewer or tester") != std::string::npos);
+        CHECK(std::string(e.what()).find("verify-task bit") != std::string::npos);
     }
     CHECK(threw);
     // The reviewer may.
@@ -395,7 +395,7 @@ static void testSocietyRoles() {
     threw = false;
     try { st.goalVerify("t", "a4", true); } catch (const std::exception& e) {
         threw = true;
-        CHECK(std::string(e.what()).find("reviewer or tester") != std::string::npos);
+        CHECK(std::string(e.what()).find("verify-goal bit") != std::string::npos);
     }
     CHECK(threw);
     threw = false;
@@ -662,6 +662,263 @@ static void testChronicle() {
     CHECK_EQ_STR(p2.society("t").gens[0].chronicler, "rec");
 }
 
+static void testAgentRegistry() {
+    std::string dir = tmpDir("agents");
+    {
+        gr::RoomStore st(dir);
+        st.agentRegister("alice", "correct horse battery");
+        st.agentRegister("bob", "staple pony nine");
+        auto names = st.agentList();
+        CHECK(names.size() == 2);
+        CHECK_EQ_STR(names[0], "alice");
+        CHECK_EQ_STR(names[1], "bob");
+        CHECK(st.agentCheck("alice", "correct horse battery"));
+        CHECK(!st.agentCheck("alice", "wrong key"));
+        CHECK(!st.agentCheck("unknown", "correct horse battery"));
+        CHECK(!st.agentCheck("alice", ""));  // empty key never matches
+        bool threw = false;
+        try { st.agentRegister("alice", "another key"); } catch (const std::exception&) {
+            threw = true;
+        }
+        CHECK(threw);
+        threw = false;
+        try { st.agentRegister("carol", "short"); } catch (const std::exception&) {
+            threw = true;  // key under 8 chars refused
+        }
+        CHECK(threw);
+    }
+    // The registry persists across reloads (hashes only — never keys).
+    gr::RoomStore st2(dir);
+    CHECK(st2.agentCheck("bob", "staple pony nine"));
+    CHECK(!st2.agentCheck("bob", "nope"));
+}
+
+static void testChamber() {
+    gr::RoomStore st(tmpDir("chamber"));
+    st.agentRegister("founder", "founder-key-123");
+    st.agentRegister("member2", "member2-key-123");
+    st.agentRegister("outsider", "outsider-key1");
+    st.createRoom("secret", true, "founder");
+
+    auto meta = st.roomMeta("secret");
+    CHECK(meta.chamber);
+    CHECK_EQ_STR(meta.creator, "founder");
+    CHECK(meta.members.size() == 1);
+    CHECK_EQ_STR(meta.members[0], "founder");
+
+    // Only members see the chamber.
+    CHECK(st.canView("secret", "founder"));
+    CHECK(!st.canView("secret", "outsider"));
+    CHECK(!st.canView("secret", ""));
+    auto vis = st.visibleRooms("outsider");
+    CHECK(vis.empty());
+    vis = st.visibleRooms("founder");
+    CHECK(vis.size() == 1 && vis[0] == "secret");
+
+    // Membership: only members may add; targets must be registered.
+    st.memberAdd("secret", "founder", "member2");
+    CHECK(st.canView("secret", "member2"));
+    bool threw = false;
+    try { st.memberAdd("secret", "outsider", "founder"); } catch (const std::exception&) {
+        threw = true;  // outsider is not a member
+    }
+    CHECK(threw);
+    threw = false;
+    try { st.memberAdd("secret", "founder", "ghost"); } catch (const std::exception&) {
+        threw = true;  // ghost is not registered
+    }
+    CHECK(threw);
+    st.memberAdd("secret", "founder", "member2");  // idempotent
+    CHECK(st.roomMeta("secret").members.size() == 2);
+
+    // A chamber without a creator is refused.
+    threw = false;
+    try { st.createRoom("bad", true, ""); } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+    CHECK(!st.roomExists("bad"));
+}
+
+static void testCustomPosts() {
+    gr::RoomStore st(tmpDir("posts"));
+    st.createRoom("t");
+    st.goalSet("t", "goal", "", "", "founder");
+
+    // The five presets are always in effect.
+    auto ps = st.posts("t");
+    CHECK(ps.size() == 5);
+
+    // A custom post with both verify bits.
+    st.postDefine("t", "auditor", true, true, "qwen-max", "founder");
+    st.postDefine("t", "scribe", false, false, "", "founder");
+    ps = st.posts("t");
+    CHECK(ps.size() == 7);
+    const gr::PostDef* auditor = nullptr;
+    for (const auto& p : ps)
+        if (p.name == "auditor") auditor = &p;
+    CHECK(auditor != nullptr);
+    CHECK(auditor->canVerifyTask && auditor->canVerifyGoal);
+    CHECK_EQ_STR(auditor->model, "qwen-max");
+
+    // Reserved / duplicate names are refused.
+    bool threw = false;
+    try { st.postDefine("t", "reviewer", true, true, "", "x"); } catch (const std::exception&) {
+        threw = true;
+    }
+    CHECK(threw);
+    threw = false;
+    try { st.postDefine("t", "auditor", false, false, "", "x"); } catch (const std::exception&) {
+        threw = true;
+    }
+    CHECK(threw);
+    threw = false;
+    try { st.postDefine("t", "bad name!", false, false, "", "x"); } catch (const std::exception&) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    // An unknown post cannot be taken; the custom one can, and its bits gate.
+    threw = false;
+    try { st.roleTake("t", "a1", "nope"); } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+    st.roleTake("t", "a1", "executor");
+    st.roleTake("t", "a2", "auditor");
+    st.roleTake("t", "a3", "scribe");
+
+    st.taskClaim("t", 1, "a1");
+    st.taskSubmit("t", 1, "a1", "done");
+    threw = false;  // scribe carries no verify-task bit
+    try { st.taskVerify("t", 1, "a3", true); } catch (const std::exception& e) {
+        threw = true;
+        CHECK(std::string(e.what()).find("verify-task bit") != std::string::npos);
+    }
+    CHECK(threw);
+    st.taskVerify("t", 1, "a2", true);  // auditor may
+
+    st.goalAchieve("t", "a1", "done");
+    threw = false;
+    try { st.goalVerify("t", "a3", true); } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+    st.goalVerify("t", "a2", true);
+    CHECK_EQ_STR(st.society("t").goal.status, "achieved");
+}
+
+static void testPopulation() {
+    gr::RoomStore st(tmpDir("population"));
+    st.createRoom("t");
+
+    // Fresh room: nobody active.
+    auto pop = st.population("t");
+    CHECK(pop.active.empty());
+
+    // A say makes the speaker active (30-minute window).
+    st.say("t", "a1", "fact", "found something", -1);
+    st.say("t", "a2", "fact", "me too", -1);
+    pop = st.population("t");
+    CHECK(pop.active.size() == 2);
+
+    // Active claims count even for silent agents.
+    st.claim("t", "a3", {"src/x.cpp"}, 600);
+    pop = st.population("t");
+    CHECK(pop.active.size() == 3);
+
+    // In-flight tasks count.
+    st.taskCreate("t", "job", "", "server");
+    st.taskClaim("t", 1, "a4");
+    pop = st.population("t");
+    CHECK(pop.active.size() == 4);
+
+    // Done tasks do not.
+    st.taskSubmit("t", 1, "a4", "ev");
+    st.taskVerify("t", 1, "a5", true);
+    pop = st.population("t");
+    CHECK(pop.active.size() == 3);
+
+    // "server" is never counted.
+    st.say("t", "server", "say", "housekeeping", -1);
+    pop = st.population("t");
+    CHECK(pop.active.size() == 3);
+}
+
+static void testReportModes() {
+    gr::RoomStore st(tmpDir("report"));
+    st.createRoom("t");
+    st.goalSet("t", "ship the parser", "all tests green", "", "founder");
+    st.roleTake("t", "rec", "recorder");
+    st.roleTake("t", "a3", "reviewer");
+
+    // Board: #1 genesis claimed, #2 done, #3/#4 open, #5 awaiting human.
+    st.taskClaim("t", 1, "a1");
+    st.taskCreate("t", "fix lexer", "", "founder");
+    st.taskCreate("t", "wire oracle", "", "founder");
+    st.taskCreate("t", "write docs", "", "founder");
+    st.taskCreate("t", "sign checklist", "", "founder", true);
+    st.taskClaim("t", 2, "a2");
+    st.taskSubmit("t", 2, "a2", "lexer green");
+    st.taskVerify("t", 2, "a3", true);
+
+    st.say("t", "a1", "fact", "lexer is recursive-descent", -1);
+    st.say("t", "a2", "fact", "oracle answers satisfied", -1);
+    st.say("t", "a1", "ask", "which grammar do we target?", -1);
+    auto deadlineAsk = st.say("t", "a3", "ask", "deadline?", -1);
+    st.say("t", "founder", "answer", "tomorrow", deadlineAsk.id);
+    st.genChronicle("t", "rec", "phase 1 | lexer done | verdict: ok | 3 tests");
+
+    auto has = [](const std::string& hay, const std::string& needle) {
+        return hay.find(needle) != std::string::npos;
+    };
+
+    // Bad mode / unknown room refuse.
+    bool threw = false;
+    try { st.genReport("t", "nonsense"); } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+    threw = false;
+    try { st.genReport("nope", "hzdf"); } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+
+    // hzdf: phase history | laws (chronicle verbatim) | open questions.
+    std::string r = st.genReport("t", "hzdf");
+    CHECK(has(r, "== HZDF-2026 report · room t =="));
+    CHECK(has(r, "goal [open]: ship the parser"));
+    CHECK(has(r, "criteria: all tests green"));
+    CHECK(has(r, "generations: 1 (G1 active)"));
+    CHECK(has(r, "tasks: 1 done / 1 in-flight / 3 open · facts: 2 · unanswered asks: 1"));
+    CHECK(has(r, "== phase history =="));
+    CHECK(has(r, "G1 active  tasks 1/5"));
+    CHECK(has(r, "== latest chronicle (verbatim — laws inside) =="));
+    CHECK(has(r, "phase 1 | lexer done | verdict: ok | 3 tests"));
+    CHECK(has(r, "== open questions =="));
+    CHECK(has(r, "- the goal remains open"));
+    CHECK(has(r, "- open task #3 wire oracle"));
+    CHECK(has(r, "ask #"));
+
+    // company: TL;DR / KPIs / by post / risks / next steps.
+    r = st.genReport("t", "company");
+    CHECK(has(r, "== company briefing · t =="));
+    CHECK(has(r, "TL;DR: goal [open] — ship the parser."));
+    CHECK(has(r, "KPIs: facts 2 · asks 1 answered / 1 open"));
+    CHECK(has(r, "by post:"));
+    CHECK(has(r, "a2 — (no post): 1 done, 0 in-flight"));
+    CHECK(has(r, "a3 — reviewer: 0 done, 0 in-flight"));
+    CHECK(has(r, "risks & blockers:"));
+    CHECK(has(r, "human sign-off pending: #5 sign checklist"));
+    CHECK(has(r, "next steps:"));
+    CHECK(has(r, "- #3 wire oracle"));
+
+    // feudal: one memorial, 国祚/朝代/军情/贡赋/民生/请旨/臣工.
+    r = st.genReport("t", "feudal");
+    CHECK(has(r, "奏为恭报 t 一域军政民情折（第1朝）"));
+    CHECK(has(r, "一、国祚。国是「ship the parser」今犹悬。"));
+    CHECK(has(r, "历1朝，今第1朝当值"));
+    CHECK(has(r, "一、军情（任务战况）。计5件：已克1，交战1，未动3。"));
+    CHECK(has(r, "【交战·a1领兵】"));
+    CHECK(has(r, "一、贡赋（验讫之功）。"));
+    CHECK(has(r, "a2贡，a3验讫"));
+    CHECK(has(r, "一、民生（事实计2条，近3条）。"));
+    CHECK(has(r, "一、请旨（待圣裁）。"));
+    CHECK(has(r, "须 human 圣裁"));
+    CHECK(has(r, "如蒙圣鉴，谨此奏闻。"));
+}
+
 int main() {
     testSha256();
     testJsonRoundTrip();
@@ -679,6 +936,11 @@ int main() {
     testOracleGate();
     testHumanSovereign();
     testChronicle();
+    testAgentRegistry();
+    testChamber();
+    testCustomPosts();
+    testPopulation();
+    testReportModes();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
 }

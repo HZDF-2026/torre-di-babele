@@ -1,4 +1,4 @@
-# integration.ps1 — end-to-end test against a throwaway serve instance.
+﻿# integration.ps1 — end-to-end test against a throwaway serve instance.
 # Usage: powershell -ExecutionPolicy Bypass -File tests\integration.ps1
 #
 # NOTE: PS 5.1 mangles JSON bodies passed inline to curl.exe (embedded double
@@ -182,7 +182,7 @@ try {
     $null = Api "POST" "/v1/rooms/soc-room/tasks/$($tk.id)/claim" '{"agent":"alice"}'
     $null = Api "POST" "/v1/rooms/soc-room/tasks/$($tk.id)/submit" '{"agent":"alice","evidence":"assessed"}'
     $r = Api "POST" "/v1/rooms/soc-room/tasks/$($tk.id)/verify" '{"agent":"carol","accept":true}'
-    Check "plain agent verify rejected (role gate)" ($r._status -ge 400 -and (($r.error -join "") -match "reviewer or tester"))
+    Check "plain agent verify rejected (role gate)" ($r._status -ge 400 -and (($r.error -join "") -match "verify-task bit"))
     $r = Api "POST" "/v1/rooms/soc-room/tasks/$($tk.id)/verify" '{"agent":"bob","accept":true}'
     Check "reviewer verifies task" ($r.status -eq "done")
     $s = Api "GET" "/v1/rooms/soc-room/society"
@@ -314,6 +314,16 @@ try {
         Remove-Job $oracleJob -Force -ErrorAction SilentlyContinue
     }
 
+    # --- P9: reporting modes (Dengyun hzdf default; company/feudal) ----------
+    $r = Api "GET" "/v1/rooms/soc2/report"
+    Check "API report defaults to hzdf" ($r.mode -eq "hzdf" -and $r.report.Contains("HZDF-2026 report") -and $r.report.Contains("phase history") -and $r.report.Contains("open questions"))
+    $r = Api "GET" "/v1/rooms/soc2/report?mode=company"
+    Check "API report company" ($r.mode -eq "company" -and $r.report.Contains("TL;DR") -and $r.report.Contains("by post:") -and $r.report.Contains("next steps:"))
+    $r = Api "GET" "/v1/rooms/soc2/report?mode=feudal"
+    Check "API report feudal" ($r.mode -eq "feudal" -and $r.report.Contains("奏为恭报") -and $r.report.Contains("贡赋") -and $r.report.Contains("如蒙圣鉴"))
+    $r = Api "GET" "/v1/rooms/soc2/report?mode=bogus"
+    Check "API report bad mode refused" ($r._status -ge 400 -and (($r.error -join "") -match "mode"))
+
     # --- MCP: tools/list has all tools --------------------------------------
     $env:GREENROOM_URL = $base
     $env:GREENROOM_TOKEN = $tok
@@ -326,6 +336,7 @@ try {
     Check "MCP tools/list has greenroom_wait" ($toolsLine.Contains("greenroom_wait"))
     Check "MCP tools/list has greenroom_search" ($toolsLine.Contains("greenroom_search"))
     Check "MCP tools/list has greenroom_society" ($toolsLine.Contains("greenroom_society"))
+    Check "MCP tools/list has greenroom_report" ($toolsLine.Contains("greenroom_report"))
 
     # --- MCP: task/search/wait round-trips through the proxy ----------------
     $call = '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"greenroom_task","arguments":{"action":"create","room":"it-room","title":"mcp task","agent":"eve"}}}'
@@ -353,6 +364,17 @@ try {
     $chLine = ($mcpOut | Where-Object { $_ -match '"id":7' }) -join ""
     Check "MCP greenroom_society gen-chronicle" ($chLine.Contains("mcp chronicle entry") -and $chLine.Contains("mcp-rec"))
 
+    $callRep = '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"greenroom_report","arguments":{"room":"soc2"}}}'
+    $mcpOut = ($init + "`n" + $callRep + "`n") | & $exe mcp
+    $repLine = ($mcpOut | Where-Object { $_ -match '"id":8' }) -join ""
+    Check "MCP greenroom_report default hzdf" ($repLine.Contains("HZDF-2026 report") -and $repLine.Contains("phase history") -and $repLine.Contains("mcp chronicle entry"))
+
+    $callRep2 = '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"greenroom_report","arguments":{"room":"soc2","mode":"feudal"}}}'
+    $mcpOut = ($init + "`n" + $callRep2 + "`n") | & $exe mcp
+    $rep2 = ($mcpOut | Where-Object { $_ -match '"id":9' }) -join ""
+    $rep2d = [Regex]::Unescape($rep2)  # decode \uXXXX escapes for the CJK check
+    Check "MCP greenroom_report feudal" ($rep2d.Contains("奏为恭报") -and $rep2d.Contains("如蒙圣鉴"))
+
     # --- CLI against the token server ---------------------------------------
     $cliOut = (& $exe search "util.cpp" 2>&1) -join ""
     Check "CLI search" ($cliOut.Contains("it-room"))
@@ -374,6 +396,16 @@ try {
     Check "CLI gen shows chronicle" ($cliOut.Contains("cli chronicle"))
     $cliOut = (& $exe task list soc2 2>&1) -join ""
     Check "CLI task list marks human gate" ($cliOut.Contains("[human sign-off]"))
+
+    $cliOut = (& $exe report soc2 2>&1) -join ""
+    Check "CLI report default hzdf" ($cliOut.Contains("HZDF-2026 report") -and $cliOut.Contains("cli chronicle of gen 3"))
+    $cliOut = (& $exe report soc2 --mode company 2>&1) -join ""
+    Check "CLI report company" ($cliOut.Contains("TL;DR") -and $cliOut.Contains("by post:"))
+    $prevEnc = [Console]::OutputEncoding
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $cliOut = (& $exe report soc2 --mode feudal 2>&1) -join ""
+    [Console]::OutputEncoding = $prevEnc
+    Check "CLI report feudal" ($cliOut.Contains("奏为恭报") -and $cliOut.Contains("如蒙圣鉴"))
 
     # --- persistence: restart serve, data survives --------------------------
     Stop-Process -Id $proc.Id -Force

@@ -3,14 +3,20 @@
 // Tool set (proxied to serve via HTTP):
 //   greenroom_protocol                          the sub-agent briefing text
 //   greenroom_status / rooms / create_room
+//   greenroom_agents                            the registered-agent roster
 //   greenroom_say / listen
 //   greenroom_claim / release / claims
 //   greenroom_board_get / board_set
 //   greenroom_verify
+//   greenroom_task                              evidence-gated task board
+//   greenroom_report                            hzdf|company|feudal room report
+//   greenroom_society                           goal/gens/roles/posts/members/
+//                                               population (post-define etc.)
 #include "mcp.h"
 
 #include <chrono>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <thread>
 
@@ -47,18 +53,34 @@ const char* kProtocolBriefing =
     "open, the server retires your generation and births the next one — the "
     "recorder should distill what was tried, what worked and what remains into "
     "a chronicle first (`gen chronicle`); the next generation starts from "
-    "chronicles, not a full history re-read. Take a role (commander, recorder, "
-    "executor, reviewer, tester); while roles are registered, only reviewer/"
-    "tester agents may verify tasks and goal achievement. A goal may declare "
-    "an oracle: an http:// URL answering {\"satisfied\": bool} — the sole judge "
-    "of achievement; credentials live inside the oracle service, never in goal "
-    "text. Tasks awaiting human sign-off (human=true) block generation "
-    "turnover until the sovereign agent 'human' signs them. Propose "
-    "achievement only with evidence (`goal achieve`); a different agent "
-    "verifies it.\n"
+    "chronicles, not a full history re-read. Chronicle format (fixed budget, "
+    "max 4096 chars — HZDF-2026 distillation style): a phase-history list "
+    "(each phase one line: problem | design | verdict | key numbers), then "
+    "laws (invariants that held across phases), then open questions (what "
+    "the next generation must resolve). Take a post (commander, recorder, "
+    "executor, reviewer, tester — or a custom post defined via "
+    "`greenroom_society post-define`); while roles are registered, only posts "
+    "carrying the verify bits may verify tasks and goal achievement. A goal "
+    "may declare an oracle: an http:// URL answering {\"satisfied\": bool} — "
+    "the sole judge of achievement; credentials live inside the oracle "
+    "service, never in goal text. Tasks awaiting human sign-off (human=true) "
+    "block generation turnover until the sovereign agent 'human' signs them. "
+    "Propose achievement only with evidence (`goal achieve`); a different "
+    "agent verifies it.\n"
     "8. Parent loop: the parent agent long-polls `greenroom wait {room}`; on a "
     "`gen` message it spawns the next generation's sub-agents with this "
-    "briefing, on `goal` ACHIEVED it stops.\n"
+    "briefing, on `goal` ACHIEVED it stops. Population protocol: poll "
+    "`greenroom_society population` — the target is 5-10 observably-active "
+    "agents per room; when activity drops below 3, replenish in batches of at "
+    "most 4 concurrent spawns. The signal is observational (active claims, "
+    "speech within 30 min, in-flight tasks) — a missing agent may just be "
+    "busy; verify before assuming death.\n"
+    "9. Reporting: when the parent or the human wants a digest, render the "
+    "room with `greenroom_report` (modes: hzdf — the default, the HZDF-2026 "
+    "distillation shape of phase history|laws|open questions; company — a "
+    "corporate briefing of TL;DR/KPIs/by-post/risks/next steps; feudal — a "
+    "court memorial of 国祚/军情/贡赋/民生/请旨). Reports are deterministic "
+    "reads — never a substitute for the chronicle.\n"
     "Claims expire after their TTL — if your work takes longer, re-claim. The room "
     "is hash-chained and audited; say what you did, do what you said.";
 
@@ -188,6 +210,15 @@ Json toolsList() {
     }
     {
         Json p = Json::object();
+        tools.push(toolDef("greenroom_agents",
+                           "List registered agent identities (the roster chambers "
+                           "authenticate against). Registration itself is a CLI "
+                           "operation: `greenroom agent register NAME --key KEY` — keys "
+                           "never travel through tool calls.",
+                           p, {}));
+    }
+    {
+        Json p = Json::object();
         p.set("room", propStr("Room name, [a-zA-Z0-9._-]"));
         tools.push(toolDef("greenroom_create_room", "Create a room for one task.", p, {"room"}));
     }
@@ -299,7 +330,8 @@ Json toolsList() {
     {
         Json p3 = Json::object();
         p3.set("action", propStr("status|goal-set|goal-achieve|goal-verify|goal-abandon|"
-                                 "gen-advance|gen-chronicle|role-take|role-list"));
+                                 "gen-advance|gen-chronicle|role-take|role-list|"
+                                 "post-define|post-list|member-add|member-list|population"));
         p3.set("room", propStr("Room name"));
         p3.set("agent", propStr("Acting agent name"));
         p3.set("text", propStr("goal-set: the god goal text"));
@@ -311,8 +343,23 @@ Json toolsList() {
         p3.set("reason", propStr("goal-abandon: why"));
         p3.set("note", propStr("gen-advance: why this generation is being retired"));
         p3.set("chronicle", propStr("gen-chronicle: the recorder's distilled closing record "
-                                     "for the active generation, max 4096 chars"));
-        p3.set("role", propStr("role-take: commander|recorder|executor|reviewer|tester"));
+                                     "for the active generation, max 4096 chars, HZDF-2026 "
+                                     "style: phase history (problem|design|verdict|key "
+                                     "numbers), laws, open questions"));
+        p3.set("role", propStr("role-take: a preset post (commander|recorder|executor|"
+                               "reviewer|tester) or a custom post defined via post-define"));
+        p3.set("post", propStr("post-define: custom post name, [A-Za-z0-9-_.]{1,32}; "
+                               "member-add: the registered agent to add to the chamber"));
+        p3.set("model", propStr("post-define: which model API serves this post (metadata "
+                                "only, optional)"));
+        Json vt = Json::object();
+        vt.set("type", Json::string("boolean"));
+        vt.set("description", Json::string("post-define: this post may verify tasks"));
+        p3.set("canVerifyTask", std::move(vt));
+        Json vg = Json::object();
+        vg.set("type", Json::string("boolean"));
+        vg.set("description", Json::string("post-define: this post may verify the god goal"));
+        p3.set("canVerifyGoal", std::move(vg));
         Json acc = Json::object();
         acc.set("type", Json::string("boolean"));
         acc.set("description", Json::string("goal-verify: true=accept, false=reject"));
@@ -320,13 +367,30 @@ Json toolsList() {
         tools.push(toolDef("greenroom_society",
                            "The society layer: a god goal the room exists to fulfill, "
                            "generations of agents (a new one is born automatically "
-                           "whenever a generation drains with the goal still open), and "
-                           "the five roles. While roles are registered only "
-                           "reviewer/tester may verify. With an oracle declared, goal "
-                           "verification requires it to answer satisfied. The recorder "
-                           "closes each generation with a fixed-budget chronicle the "
-                           "next generation starts from.",
+                           "whenever a generation drains with the goal still open), "
+                           "posts (the five presets plus room-defined custom posts with "
+                           "verify permission bits), chamber membership, and the "
+                           "population signal (activeAgents — target 5-10 per room, "
+                           "replenish below 3). While roles are registered only posts "
+                           "carrying the verify bits may verify. With an oracle declared, "
+                           "goal verification requires it to answer satisfied. The "
+                           "recorder closes each generation with a fixed-budget chronicle "
+                           "the next generation starts from.",
                            p3, {"action", "room"}));
+    }
+    {
+        Json p4 = Json::object();
+        p4.set("room", propStr("Room name"));
+        p4.set("mode", propStr("hzdf (default — HZDF-2026 distillation: phase "
+                               "history|laws|open questions) | company (corporate "
+                               "briefing: TL;DR/KPIs/by post/risks/next steps) | "
+                               "feudal (court memorial: 国祚/军情/贡赋/民生/请旨)"));
+        tools.push(toolDef("greenroom_report",
+                           "Render the room as a structured report for the parent "
+                           "agent or the human. Three modes: hzdf (Dengyun default), "
+                           "company and feudal (Lanshan additions). Deterministic "
+                           "read-only render of room state.",
+                           p4, {"room"}));
     }
     Json out = Json::object();
     out.set("tools", std::move(tools));
@@ -335,23 +399,37 @@ Json toolsList() {
 
 // ---- HTTP proxy helpers ------------------------------------------------
 
+// Identity headers from the environment (GREENROOM_AGENT + GREENROOM_KEY).
+// Sub-agents that work in chambers are provisioned with both; open rooms
+// ignore them.
+std::map<std::string, std::string> identityHeaders() {
+    std::map<std::string, std::string> h;
+    std::string agent = envOr("GREENROOM_AGENT", "");
+    std::string key = envOr("GREENROOM_KEY", "");
+    if (!agent.empty() && !key.empty()) {
+        h["X-GR-Agent"] = agent;
+        h["X-GR-Key"] = key;
+    }
+    return h;
+}
+
 std::string get(const Target& t, const std::string& target) {
-    ClientResult r =
-        httpClient(t.host, t.port, "GET", target, "", envOr("GREENROOM_TOKEN", ""));
+    ClientResult r = httpClient(t.host, t.port, "GET", target, "",
+                                envOr("GREENROOM_TOKEN", ""), 0, identityHeaders());
     if (!r.ok && r.status == 0) return "{\"error\":\"transport: " + r.err + "\"}";
     return r.body;
 }
 
 std::string post(const Target& t, const std::string& target, const Json& body) {
-    ClientResult r =
-        httpClient(t.host, t.port, "POST", target, body.dump(), envOr("GREENROOM_TOKEN", ""));
+    ClientResult r = httpClient(t.host, t.port, "POST", target, body.dump(),
+                                envOr("GREENROOM_TOKEN", ""), 0, identityHeaders());
     if (!r.ok && r.status == 0) return "{\"error\":\"transport: " + r.err + "\"}";
     return r.body;
 }
 
 std::string put(const Target& t, const std::string& target, const Json& body) {
-    ClientResult r =
-        httpClient(t.host, t.port, "PUT", target, body.dump(), envOr("GREENROOM_TOKEN", ""));
+    ClientResult r = httpClient(t.host, t.port, "PUT", target, body.dump(),
+                                envOr("GREENROOM_TOKEN", ""), 0, identityHeaders());
     if (!r.ok && r.status == 0) return "{\"error\":\"transport: " + r.err + "\"}";
     return r.body;
 }
@@ -388,6 +466,7 @@ std::string callTool(const std::string& name, const Json& args) {
     if (name == "greenroom_protocol") return kProtocolBriefing;
     if (name == "greenroom_status") return get(t, "/v1/status");
     if (name == "greenroom_rooms") return get(t, "/v1/rooms");
+    if (name == "greenroom_agents") return get(t, "/v1/agents");
 
     if (name == "greenroom_create_room") {
         Json body = Json::object();
@@ -428,6 +507,11 @@ std::string callTool(const std::string& name, const Json& args) {
         long long to = argNum(args, "timeout_ms", 0);
         if (to > 0) q += "&timeout_ms=" + std::to_string(to);
         return get(t, base + "/wait" + q);
+    }
+    if (name == "greenroom_report") {
+        std::string mode = argStr(args, "mode", "hzdf");
+        if (mode.empty()) mode = "hzdf";
+        return get(t, base + "/report?mode=" + urlEnc(mode));
     }
     if (name == "greenroom_task") {
         std::string action = argStr(args, "action");
@@ -517,6 +601,26 @@ std::string callTool(const std::string& name, const Json& args) {
             return post(t, base + "/roles", body);
         }
         if (action == "role-list") return get(t, base + "/roles");
+        if (action == "post-define") {
+            Json body = Json::object();
+            body.set("name", Json::string(argStr(args, "post")));
+            body.set("agent", Json::string(agent.empty() ? "anon" : agent));
+            if (const Json* b = args.get("canVerifyTask"); b && b->isBool())
+                body.set("canVerifyTask", Json::boolean(b->b));
+            if (const Json* b = args.get("canVerifyGoal"); b && b->isBool())
+                body.set("canVerifyGoal", Json::boolean(b->b));
+            std::string model = argStr(args, "model");
+            if (!model.empty()) body.set("model", Json::string(model));
+            return post(t, base + "/posts", body);
+        }
+        if (action == "post-list") return get(t, base + "/posts");
+        if (action == "member-add") {
+            Json body = Json::object();
+            body.set("agent", Json::string(argStr(args, "post")));
+            return post(t, base + "/members", body);
+        }
+        if (action == "member-list") return get(t, base + "/members");
+        if (action == "population") return get(t, base + "/population");
         return "{\"error\":\"unknown action: " + action + "\"}";
     }
     if (name == "greenroom_claim") {

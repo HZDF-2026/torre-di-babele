@@ -97,15 +97,57 @@ struct Generation {
 };
 
 struct RoleEntry {
-    std::string role;         // commander|recorder|executor|reviewer|tester
+    std::string role;         // a preset role or a custom post (posts below)
     std::string agent;
     long long ts = 0;
+};
+
+// A custom post (岗位): a named duty with permission bits. The five classic
+// roles are implicit presets (reviewer/tester carry both verify bits); a room
+// may define more. model is metadata only — the future executor reads it to
+// know which model API serves this post; nothing in v0.4.0 acts on it.
+struct PostDef {
+    std::string name;
+    bool canVerifyTask = false;
+    bool canVerifyGoal = false;
+    std::string model;
+    std::string createdBy;
+    long long createdTs = 0;
+    bool preset = false;      // true for the five built-ins (not persisted)
 };
 
 struct Society {
     Goal goal;
     std::vector<Generation> gens;
     std::vector<RoleEntry> roles;
+    std::vector<PostDef> posts;   // custom posts only; presets are implicit
+};
+
+// Room-level metadata (room.json). A chamber is a secret room: only members
+// read/write it, existence is hidden from non-members (list/search/room routes
+// answer 404), and every action inside is bound to a verified agent identity.
+struct RoomMeta {
+    bool chamber = false;
+    std::string creator;                  // "" for legacy rooms
+    std::vector<std::string> members;    // sorted agent names
+    long long createdTs = 0;
+};
+
+// The population signal: which agents are observably active in the room right
+// now. Union of active claims, speech within the window, and assignees of
+// in-flight tasks — the parent loop uses it to keep 5-10 agents alive and
+// replenish at <3.
+struct Population {
+    std::vector<std::string> active;  // sorted agent names, "server" excluded
+    long long windowMs = 1800000;     // speech window
+};
+
+// A registered agent identity. Only the hash of the key is stored; the key
+// itself never touches disk or any room payload.
+struct AgentEntry {
+    std::string name;
+    std::string keyHash;
+    long long createdTs = 0;
 };
 
 // One reading of a goal oracle: the raw HTTP response plus interpretation.
@@ -134,8 +176,31 @@ public:
     // All methods are thread-safe (one global mutex).
 
     std::vector<std::string> rooms();          // sorted
-    bool createRoom(const std::string& name);   // false if exists/invalid
+    // chamber=true creates a secret room; creator (a registered agent) becomes
+    // its first member. false if exists/invalid.
+    bool createRoom(const std::string& name, bool chamber = false,
+                   const std::string& creator = "");
     bool roomExists(const std::string& name);
+    RoomMeta roomMeta(const std::string& room);
+    // Adds a registered agent to a chamber's member list. Caller must be a
+    // member. Idempotent.
+    void memberAdd(const std::string& room, const std::string& caller,
+                   const std::string& agent);
+    // Chamber visibility: member of the chamber, or the room is open.
+    bool canView(const std::string& room, const std::string& viewer);
+    // Rooms the viewer may see (chambers they are not in are omitted).
+    std::vector<std::string> visibleRooms(const std::string& viewer);
+
+    // Agent identity registry (server-global, <dataDir>/agents.json).
+    // Registers name + key (hash stored, key discarded). Throws on bad
+    // name/key or duplicate.
+    void agentRegister(const std::string& name, const std::string& key);
+    std::vector<std::string> agentList();
+    // True iff name is registered and the key matches.
+    bool agentCheck(const std::string& name, const std::string& key);
+
+    // Population: observably-active agents in the room right now.
+    Population population(const std::string& room);
 
     // throws std::runtime_error on unknown room / bad type
     Message say(const std::string& room, const std::string& agent,
@@ -151,9 +216,12 @@ public:
                                       long long timeoutMs);
 
     // Case-insensitive ASCII substring search over content/agent/type. Empty
-    // roomFilter = all rooms. Returns newest-first, capped at limit.
+    // roomFilter = all rooms the VIEWER may see (chamber rooms are hidden
+    // from non-members — also when named explicitly in roomFilter).
+    // Returns newest-first, capped at limit.
     std::vector<SearchHit> search(const std::string& query,
-                                  const std::string& roomFilter, int limit);
+                                  const std::string& roomFilter, int limit,
+                                  const std::string& viewer);
 
     // Claim semantics per PROTOCOL.md: conflict = scope intersects an ACTIVE
     // claim held by a DIFFERENT agent. Same-agent overlap renews the TTL.
@@ -205,10 +273,10 @@ public:
     void goalAchieve(const std::string& room, const std::string& agent,
                      const std::string& evidence);
     // Verifies a proposed achievement. Verifier must differ from the achiever
-    // and (while roles are registered) hold the reviewer or tester role —
-    // agent "human" is the sovereign and always passes that gate. With an
-    // oracle declared, accept=true additionally requires a satisfied oracle
-    // reading (fetched by the API layer, passed in here).
+    // and (while roles are registered) hold a post carrying the verify-goal
+    // bit — agent "human" is the sovereign and always passes that gate. With
+    // an oracle declared, accept=true additionally requires a satisfied
+    // oracle reading (fetched by the API layer, passed in here).
     // accept=true closes the society; reject reopens the goal (and may birth
     // the next generation if the board drained meanwhile).
     void goalVerify(const std::string& room, const std::string& agent, bool accept,
@@ -226,9 +294,23 @@ public:
     // chronicles instead of the full history.
     void genChronicle(const std::string& room, const std::string& agent,
                       const std::string& text);
-    // Registers an agent under one of the five roles.
+    // Registers an agent under a preset role or a defined post.
     void roleTake(const std::string& room, const std::string& agent,
                   const std::string& role);
+    // Defines a custom post. Throws on bad/duplicate name (presets included).
+    void postDefine(const std::string& room, const std::string& name,
+                    bool canVerifyTask, bool canVerifyGoal, const std::string& model,
+                    const std::string& agent);
+    // All posts in effect: the five presets plus the room's custom ones.
+    std::vector<PostDef> posts(const std::string& room);
+
+    // Reporting modes (PROTOCOL.md §Reports): deterministic renders of room
+    // state — no new state, nothing persisted. "hzdf" is the Dengyun default
+    // (the HZDF-2026 distillation shape: phase history | laws | open
+    // questions); "company" renders a corporate briefing; "feudal" renders a
+    // court memorial. The Lanshan tier adds company/feudal on top of hzdf.
+    // Throws on unknown room or unknown mode.
+    std::string genReport(const std::string& room, const std::string& mode);
 
     const std::string& dataDir() const { return dataDir_; }
 
@@ -241,6 +323,7 @@ private:
         std::vector<Task> tasks;
         long long nextTaskId = 1;
         Society soc;
+        RoomMeta meta;
     };
 
     RoomData& load(const std::string& room);   // caller holds mutex
@@ -248,6 +331,10 @@ private:
                       const std::string& type, const std::string& content,
                       long long ref);          // caller holds mutex
     std::string roomDir(const std::string& room) const;
+    void persistMeta(const std::string& room, RoomData& rd);
+    void persistAgents();
+    void loadAgents();                        // caller holds mutex
+    RoomMeta& metaLocked(const std::string& room, RoomData& rd);  // legacy-safe
     void persistClaims(const std::string& room, RoomData& rd);
     void persistBoard(const std::string& room, RoomData& rd);
     void persistTasks(const std::string& room, RoomData& rd);
@@ -258,7 +345,9 @@ private:
                           const std::string& detail, const std::string& creator, int gen,
                           bool human = false);
     int currentGenLocked(const RoomData& rd) const;
-    bool hasVerifyRoleLocked(const RoomData& rd, const std::string& agent) const;
+    static std::vector<PostDef> effectivePostsLocked(const RoomData& rd);
+    bool canVerifyTaskLocked(const RoomData& rd, const std::string& agent) const;
+    bool canVerifyGoalLocked(const RoomData& rd, const std::string& agent) const;
     void retireGenLocked(const std::string& room, RoomData& rd, const std::string& note);
     void birthGenLocked(const std::string& room, RoomData& rd);
     void checkGenDrainLocked(const std::string& room, RoomData& rd);
@@ -267,6 +356,8 @@ private:
     std::mutex mu_;
     std::condition_variable cv_;  // notified on every new message
     std::map<std::string, RoomData> cache_;
+    std::vector<AgentEntry> agents_;   // registry cache, lazy-loaded
+    bool agentsLoaded_ = false;
 };
 
 // Canonical message hash, PROTOCOL.md §"Message envelope".

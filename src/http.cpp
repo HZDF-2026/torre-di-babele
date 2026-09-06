@@ -283,7 +283,8 @@ bool HttpServer::run(std::string& errOut) {
 
 ClientResult httpClient(const std::string& host, int port, const std::string& method,
                         const std::string& rawTarget, const std::string& body,
-                        const std::string& bearer, long long timeoutMs) {
+                        const std::string& bearer, long long timeoutMs,
+                        const std::map<std::string, std::string>& extraHeaders) {
     ClientResult r;
     std::string err;
     if (!netInit(err)) {
@@ -322,6 +323,7 @@ ClientResult httpClient(const std::string& host, int port, const std::string& me
                       "\r\nContent-Type: application/json\r\nContent-Length: " +
                       std::to_string(body.size()) + "\r\nConnection: close\r\n";
     if (!bearer.empty()) req += "Authorization: Bearer " + bearer + "\r\n";
+    for (const auto& kv : extraHeaders) req += kv.first + ": " + kv.second + "\r\n";
     req += "\r\n" + body;
     if (!sendAll(s, req.data(), req.size())) {
         r.err = "send failed";

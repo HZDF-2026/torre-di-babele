@@ -5,6 +5,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <set>
+#include <sstream>
 #include <stdexcept>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -181,6 +183,20 @@ Society societyFromJson(const Json& j) {
             s.roles.push_back(r);
         }
     }
+    if (const Json* a = j.get("posts"); a && a->isArr()) {
+        for (const Json& pj : a->arr) {
+            PostDef p;
+            p.name = jsonStr(pj, "name");
+            if (const Json* b = pj.get("canVerifyTask"); b && b->isBool())
+                p.canVerifyTask = b->b;
+            if (const Json* b = pj.get("canVerifyGoal"); b && b->isBool())
+                p.canVerifyGoal = b->b;
+            p.model = jsonStr(pj, "model");
+            p.createdBy = jsonStr(pj, "createdBy");
+            p.createdTs = jsonNum(pj, "createdTs");
+            s.posts.push_back(p);
+        }
+    }
     return s;
 }
 
@@ -228,7 +244,70 @@ Json societyToJson(const Society& s) {
         roles.push(std::move(rj));
     }
     obj.set("roles", std::move(roles));
+    Json posts = Json::array();
+    for (const PostDef& p : s.posts) {
+        Json pj = Json::object();
+        pj.set("name", Json::string(p.name));
+        pj.set("canVerifyTask", Json::boolean(p.canVerifyTask));
+        pj.set("canVerifyGoal", Json::boolean(p.canVerifyGoal));
+        pj.set("model", Json::string(p.model));
+        pj.set("createdBy", Json::string(p.createdBy));
+        pj.set("createdTs", Json::number(static_cast<double>(p.createdTs)));
+        posts.push(std::move(pj));
+    }
+    obj.set("posts", std::move(posts));
     return obj;
+}
+
+// The five preset posts. reviewer/tester carry both verify bits — the classic
+// division-of-labor gate. Custom posts (defined per room) extend this table.
+struct PostBits {
+    const char* name;
+    bool vt;
+    bool vg;
+};
+const PostBits kPresets[] = {
+    {"commander", false, false}, {"recorder", false, false},
+    {"executor", false, false},   {"reviewer", true, true},
+    {"tester", true, true},
+};
+
+bool isPresetPost(const std::string& name) {
+    for (const PostBits& p : kPresets)
+        if (name == p.name) return true;
+    return false;
+}
+
+bool validPostName(const std::string& s) {
+    if (s.empty() || s.size() > 32) return false;
+    for (char c : s)
+        if (!(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') &&
+            !(c >= '0' && c <= '9') && c != '-' && c != '_' && c != '.')
+            return false;
+    return true;
+}
+
+RoomMeta roomMetaFromJson(const Json& j) {
+    RoomMeta m;
+    if (const Json* b = j.get("chamber"); b && b->isBool()) m.chamber = b->b;
+    m.creator = jsonStr(j, "creator");
+    if (const Json* a = j.get("members"); a && a->isArr()) {
+        for (const Json& mj : a->arr)
+            if (mj.isStr()) m.members.push_back(mj.str);
+    }
+    m.createdTs = jsonNum(j, "createdTs");
+    return m;
+}
+
+Json roomMetaToJson(const RoomMeta& m) {
+    Json j = Json::object();
+    j.set("chamber", Json::boolean(m.chamber));
+    j.set("creator", Json::string(m.creator));
+    Json arr = Json::array();
+    for (const std::string& s : m.members) arr.push(Json::string(s));
+    j.set("members", std::move(arr));
+    j.set("createdTs", Json::number(static_cast<double>(m.createdTs)));
+    return j;
 }
 
 std::string asciiLower(const std::string& s) {
@@ -406,6 +485,11 @@ RoomStore::RoomData& RoomStore::load(const std::string& room) {
         Json j;
         if (Json::parse(readBytes(sf), j) && j.isObj()) rd.soc = societyFromJson(j);
     }
+    std::string rf = pathJoin(roomDir(room), "room.json");
+    if (fileExists(rf)) {
+        Json j;
+        if (Json::parse(readBytes(rf), j) && j.isObj()) rd.meta = roomMetaFromJson(j);
+    }
     long long maxClaimId = 0;
     for (const Claim& c : rd.claims) maxClaimId = std::max(maxClaimId, c.id);
     rd.nextClaimId = maxClaimId + 1;
@@ -421,14 +505,532 @@ bool RoomStore::roomExists(const std::string& room) {
     return ::stat(roomDir(room).c_str(), &st) == 0 && (st.st_mode & S_IFDIR);
 }
 
-bool RoomStore::createRoom(const std::string& room) {
+bool RoomStore::createRoom(const std::string& room, bool chamber,
+                           const std::string& creator) {
+    // Validate before any side effect: a throw must not leave a half-built
+    // room directory behind.
+    if (chamber && creator.empty())
+        throw std::runtime_error("a chamber needs a registered creator — send identity "
+                                 "headers (X-GR-Agent/X-GR-Key)");
     std::lock_guard<std::mutex> lock(mu_);
     if (!validRoomName(room) || roomExists(room)) return false;
     if (!makeDirs(roomDir(room))) return false;
     load(room);  // initializes empty cache entry
-    sayLocked(room, "server", "say", "room created", -1);
+    RoomData& rd = load(room);
+    rd.meta.chamber = chamber;
+    rd.meta.creator = creator;
+    rd.meta.createdTs = nowMs();
+    if (chamber) rd.meta.members.push_back(creator);  // creator is the first member
+    persistMeta(room, rd);
+    sayLocked(room, "server", "say",
+              chamber ? "room created (chamber — members only, actions are identity-bound)"
+                      : "room created",
+              -1);
     return true;
 }
+
+RoomMeta RoomStore::roomMeta(const std::string& room) {
+    std::lock_guard<std::mutex> lock(mu_);
+    return load(room).meta;
+}
+
+void RoomStore::persistMeta(const std::string& room, RoomData& rd) {
+    writeBytes(pathJoin(roomDir(room), "room.json"), roomMetaToJson(rd.meta).dump() + "\n");
+}
+
+void RoomStore::memberAdd(const std::string& room, const std::string& caller,
+                          const std::string& agent) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (caller.empty() || caller.size() > 64) throw std::runtime_error("bad caller name");
+    if (agent.empty() || agent.size() > 64) throw std::runtime_error("bad agent name");
+    loadAgents();
+    bool known = false;
+    for (const AgentEntry& a : agents_)
+        if (a.name == agent) known = true;
+    if (!known)
+        throw std::runtime_error("unknown agent: " + agent +
+                                 " — members must be registered agents");
+    RoomData& rd = load(room);
+    if (!rd.meta.chamber)
+        throw std::runtime_error("not a chamber room — membership only guards chambers");
+    bool callerIsMember = false;
+    for (const std::string& m : rd.meta.members)
+        if (m == caller) callerIsMember = true;
+    if (!callerIsMember)
+        throw std::runtime_error("only chamber members may add members");
+    for (const std::string& m : rd.meta.members)
+        if (m == agent) return;  // idempotent
+    rd.meta.members.push_back(agent);
+    std::sort(rd.meta.members.begin(), rd.meta.members.end());
+    persistMeta(room, rd);
+    sayLocked(room, "server", "role", caller + " added " + agent + " to the chamber", -1);
+}
+
+bool RoomStore::canView(const std::string& room, const std::string& viewer) {
+    std::lock_guard<std::mutex> lock(mu_);
+    RoomData& rd = load(room);
+    if (!rd.meta.chamber) return true;
+    for (const std::string& m : rd.meta.members)
+        if (m == viewer) return true;
+    return false;
+}
+
+std::vector<std::string> RoomStore::visibleRooms(const std::string& viewer) {
+    std::lock_guard<std::mutex> lock(mu_);
+    std::vector<std::string> out;
+    for (const std::string& room : rooms()) {
+        RoomData& rd = load(room);
+        if (!rd.meta.chamber) {
+            out.push_back(room);
+            continue;
+        }
+        for (const std::string& m : rd.meta.members)
+            if (m == viewer) {
+                out.push_back(room);
+                break;
+            }
+    }
+    return out;
+}
+
+// ---- agent identity registry ----------------------------------------------
+
+void RoomStore::loadAgents() {
+    if (agentsLoaded_) return;
+    agentsLoaded_ = true;
+    std::string f = pathJoin(dataDir_, "agents.json");
+    if (!fileExists(f)) return;
+    Json j;
+    if (!Json::parse(readBytes(f), j) || !j.isArr()) return;
+    for (const Json& aj : j.arr) {
+        AgentEntry a;
+        a.name = jsonStr(aj, "name");
+        a.keyHash = jsonStr(aj, "keyHash");
+        a.createdTs = jsonNum(aj, "createdTs");
+        if (!a.name.empty() && !a.keyHash.empty()) agents_.push_back(a);
+    }
+}
+
+void RoomStore::persistAgents() {
+    Json arr = Json::array();
+    for (const AgentEntry& a : agents_) {
+        Json j = Json::object();
+        j.set("name", Json::string(a.name));
+        j.set("keyHash", Json::string(a.keyHash));
+        j.set("createdTs", Json::number(static_cast<double>(a.createdTs)));
+        arr.push(std::move(j));
+    }
+    writeBytes(pathJoin(dataDir_, "agents.json"), arr.dump() + "\n");
+}
+
+void RoomStore::agentRegister(const std::string& name, const std::string& key) {
+    if (name.empty() || name.size() > 64) throw std::runtime_error("bad agent name");
+    if (key.size() < 8 || key.size() > 128)
+        throw std::runtime_error("bad key (8..128 chars) — keys are hashed with SHA-256, "
+                                 "never stored");
+    std::lock_guard<std::mutex> lock(mu_);
+    loadAgents();
+    for (const AgentEntry& a : agents_)
+        if (a.name == name)
+            throw std::runtime_error("agent name already registered: " + name);
+    AgentEntry a;
+    a.name = name;
+    a.keyHash = sha256Hex(key);
+    a.createdTs = nowMs();
+    agents_.push_back(a);
+    std::sort(agents_.begin(), agents_.end(),
+              [](const AgentEntry& x, const AgentEntry& y) { return x.name < y.name; });
+    persistAgents();
+}
+
+std::vector<std::string> RoomStore::agentList() {
+    std::lock_guard<std::mutex> lock(mu_);
+    loadAgents();
+    std::vector<std::string> out;
+    for (const AgentEntry& a : agents_) out.push_back(a.name);
+    return out;
+}
+
+bool RoomStore::agentCheck(const std::string& name, const std::string& key) {
+    if (name.empty() || key.empty()) return false;
+    std::lock_guard<std::mutex> lock(mu_);
+    loadAgents();
+    for (const AgentEntry& a : agents_)
+        if (a.name == name) return a.keyHash == sha256Hex(key);
+    return false;
+}
+
+// ---- population -------------------------------------------------------------
+
+Population RoomStore::population(const std::string& room) {
+    std::lock_guard<std::mutex> lock(mu_);
+    RoomData& rd = load(room);
+    sweepExpired(room, rd);
+    long long cutoff = nowMs() - 1800000;
+    std::set<std::string> act;
+    for (const Claim& c : rd.claims)
+        if (c.active && c.agent != "server") act.insert(c.agent);
+    for (const Message& m : rd.msgs)
+        if (m.ts >= cutoff && m.agent != "server") act.insert(m.agent);
+    for (const Task& t : rd.tasks)
+        if ((t.status == "claimed" || t.status == "submitted") && !t.assignee.empty())
+            act.insert(t.assignee);
+    Population p;
+    p.active.assign(act.begin(), act.end());
+    return p;
+}
+
+// ---- reports -----------------------------------------------------------------
+
+namespace {
+
+// Plain-data snapshot the report renderers work on — no RoomData dependency,
+// built once under the store lock, then rendered lock-free.
+struct ReportSnap {
+    std::string room;
+    bool chamber = false;
+    bool hasGoal = false;
+    std::string goalText, goalStatus, goalCriteria;
+    int genCount = 0;
+    int activeGen = 0;
+    struct Phase {
+        int n = 0;
+        bool active = false;
+        std::string chronicle;
+        int done = 0;
+        int total = 0;
+    };
+    std::vector<Phase> phases;
+    int tDone = 0, tInFlight = 0, tOpen = 0, tHuman = 0;
+    std::vector<std::string> openTasks, doneTasks, inFlightTasks, humanTasks;
+    std::map<std::string, int> byAgentDone, byAgentInFlight;
+    std::map<std::string, std::string> agentPost;
+    int facts = 0;
+    std::vector<std::string> recentFacts;      // newest-first, max 3
+    std::vector<std::string> openAsks;         // "id|agent|content"
+    int answeredAsks = 0;
+    std::vector<std::string> activeAgents;     // sorted
+    int activeClaims = 0;
+};
+
+// Cap by code points, never cutting a UTF-8 sequence mid-way.
+std::string utf8Truncate(const std::string& s, size_t maxCp) {
+    size_t cp = 0, i = 0;
+    while (i < s.size()) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t len = 1;
+        if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        if (cp >= maxCp) break;
+        ++cp;
+        i = (i + len > s.size()) ? s.size() : i + len;
+    }
+    return s.substr(0, i);
+}
+
+std::string firstLine(const std::string& text, size_t maxCp) {
+    for (const std::string& line : split(text, '\n')) {
+        std::string t = trim(line);
+        if (!t.empty()) return utf8Truncate(t, maxCp);
+    }
+    return "";
+}
+
+// HZDF-2026 distillation shape: phase history (one line per generation),
+// laws (inside the latest chronicle, verbatim), open questions.
+std::string renderHzdf(const ReportSnap& s) {
+    std::ostringstream o;
+    o << "== HZDF-2026 report · room " << s.room
+      << (s.chamber ? " (chamber)" : "") << " ==\n";
+    if (s.hasGoal) {
+        o << "goal [" << s.goalStatus << "]: " << utf8Truncate(s.goalText, 160) << "\n"
+          << "criteria: " << (s.goalCriteria.empty() ? "-" : utf8Truncate(s.goalCriteria, 160))
+          << "\n";
+    } else {
+        o << "no goal — a flat collaboration room\n";
+    }
+    o << "generations: " << s.genCount
+      << (s.activeGen > 0 ? " (G" + std::to_string(s.activeGen) + " active)" : "")
+      << " · tasks: " << s.tDone << " done / " << s.tInFlight << " in-flight / "
+      << s.tOpen << " open · facts: " << s.facts
+      << " · unanswered asks: " << s.openAsks.size()
+      << " · active agents: " << s.activeAgents.size() << "\n";
+
+    o << "== phase history ==\n";
+    if (s.phases.empty()) o << "(no generations yet)\n";
+    for (const ReportSnap::Phase& p : s.phases) {
+        o << "G" << p.n << (p.active ? " active  " : " retired  ") << "tasks "
+          << p.done << "/" << p.total << "  "
+          << (p.chronicle.empty() ? "(no chronicle)"
+                                  : firstLine(p.chronicle, 100))
+          << "\n";
+    }
+
+    o << "== latest chronicle (verbatim — laws inside) ==\n";
+    const std::string* latest = nullptr;
+    for (const ReportSnap::Phase& p : s.phases)
+        if (!p.chronicle.empty()) latest = &p.chronicle;
+    if (latest) o << *latest << "\n";
+    else o << "(none yet — the recorder distills before generation turnover)\n";
+
+    o << "== open questions ==\n";
+    int lines = 0;
+    if (s.hasGoal && (s.goalStatus == "open" || s.goalStatus == "proposed")) {
+        o << "- the goal remains " << s.goalStatus << "\n";
+        ++lines;
+    }
+    for (const std::string& t : s.openTasks) {
+        if (lines >= 10) { o << "… and " << (s.openTasks.size() + s.openAsks.size() - lines)
+                             << " more\n"; break; }
+        o << "- open task " << t << "\n";
+        ++lines;
+    }
+    for (const std::string& a : s.openAsks) {
+        if (lines >= 10) break;
+        o << "- " << a << "\n";
+        ++lines;
+    }
+    if (lines == 0) o << "(none)\n";
+    return o.str();
+}
+
+// Corporate briefing: TL;DR, KPIs, per-post rollup, risks, next steps.
+std::string renderCompany(const ReportSnap& s) {
+    std::ostringstream o;
+    o << "== company briefing · " << s.room << (s.chamber ? " (chamber)" : "")
+      << " ==\n";
+    o << "TL;DR: ";
+    if (s.hasGoal)
+        o << "goal [" << s.goalStatus << "] — " << utf8Truncate(s.goalText, 120)
+          << ". ";
+    else
+        o << "no goal — flat collaboration. ";
+    o << s.genCount << " generation(s) in; board " << s.tDone << " done / "
+      << s.tInFlight << " in-flight / " << s.tOpen << " open.\n";
+    o << "KPIs: facts " << s.facts << " · asks " << s.answeredAsks
+      << " answered / " << s.openAsks.size() << " open · active agents "
+      << s.activeAgents.size() << " · active claims " << s.activeClaims;
+    if (s.tHuman > 0) o << " · human sign-off pending " << s.tHuman;
+    o << "\n";
+
+    o << "by post:\n";
+    std::set<std::string> staff(s.activeAgents.begin(), s.activeAgents.end());
+    for (const auto& kv : s.byAgentDone) staff.insert(kv.first);
+    for (const auto& kv : s.byAgentInFlight) staff.insert(kv.first);
+    if (staff.empty()) {
+        o << "  (nobody on the board yet)\n";
+    } else {
+        for (const std::string& a : staff) {
+            std::string post = "(no post)";
+            auto it = s.agentPost.find(a);
+            if (it != s.agentPost.end()) post = it->second;
+            int done = 0, inf = 0;
+            if (s.byAgentDone.count(a)) done = s.byAgentDone.at(a);
+            if (s.byAgentInFlight.count(a)) inf = s.byAgentInFlight.at(a);
+            o << "  " << a << " — " << post << ": " << done << " done, " << inf
+              << " in-flight\n";
+        }
+    }
+
+    o << "risks & blockers:\n";
+    int rl = 0;
+    for (const std::string& t : s.humanTasks) { o << "  - human sign-off pending: " << t << "\n"; ++rl; }
+    for (const std::string& a : s.openAsks) {
+        if (rl >= 10) break;
+        o << "  - " << a << "\n";
+        ++rl;
+    }
+    if (rl == 0) o << "  (none)\n";
+
+    o << "next steps:\n";
+    if (s.openTasks.empty()) {
+        o << "  (board is clear"
+          << (s.hasGoal && s.goalStatus == "open"
+                  ? " — propose achievement or retire the generation"
+                  : "")
+          << ")\n";
+    } else {
+        int nl = 0;
+        for (const std::string& t : s.openTasks) {
+            if (nl >= 10) { o << "  … and " << (s.openTasks.size() - nl) << " more\n"; break; }
+            o << "  - " << t << "\n";
+            ++nl;
+        }
+    }
+    return o.str();
+}
+
+// Court memorial: one memorial covering 国祚/朝代/军情/贡赋/民生/请旨/臣工.
+std::string renderFeudal(const ReportSnap& s) {
+    std::ostringstream o;
+    o << "奏为恭报 " << s.room << (s.chamber ? "（密室）" : "")
+      << " 一域军政民情折";
+    if (s.activeGen > 0) o << "（第" << s.activeGen << "朝）";
+    o << "\n";
+
+    o << "一、国祚。";
+    if (!s.hasGoal) {
+        o << "未立国祚，散装共事之域。\n";
+    } else {
+        std::string st = s.goalStatus == "open"        ? "犹悬"
+                         : s.goalStatus == "proposed"  ? "已奏请验功，待核"
+                         : s.goalStatus == "achieved"  ? "大功告成"
+                                                      : "业已罢黜";
+        o << "国是「" << utf8Truncate(s.goalText, 80) << "」今" << st << "。\n";
+    }
+
+    o << "一、朝代。历" << s.genCount << "朝";
+    if (s.activeGen > 0) o << "，今第" << s.activeGen << "朝当值";
+    o << "；臣工" << s.activeAgents.size() << "员在值。\n";
+
+    int total = s.tDone + s.tInFlight + s.tOpen;
+    o << "一、军情（任务战况）。计" << total << "件：已克" << s.tDone
+      << "，交战" << s.tInFlight << "，未动" << s.tOpen << "。\n";
+    if (total == 0) {
+        o << "  （无战事）\n";
+    } else {
+        int ml = 0;
+        for (const std::string& t : s.inFlightTasks) {
+            if (ml >= 10) { o << "  ……余" << (total - ml) << "件从略。\n"; break; }
+            o << "  " << t << "\n";
+            ++ml;
+        }
+        for (const std::string& t : s.openTasks) {
+            if (ml >= 10) { o << "  ……余" << (total - ml) << "件从略。\n"; break; }
+            o << "  " << t << "\n";
+            ++ml;
+        }
+    }
+
+    o << "一、贡赋（验讫之功）。\n";
+    if (s.doneTasks.empty()) {
+        o << "  （暂无贡赋）\n";
+    } else {
+        for (size_t i = 0; i < s.doneTasks.size() && i < 10; ++i)
+            o << "  " << s.doneTasks[i] << "\n";
+        if (s.doneTasks.size() > 10)
+            o << "  ……余" << (s.doneTasks.size() - 10) << "件从略。\n";
+    }
+
+    o << "一、民生（事实计" << s.facts << "条，近3条）。\n";
+    if (s.recentFacts.empty()) {
+        o << "  （民生无录）\n";
+    } else {
+        for (const std::string& f : s.recentFacts) o << "  " << f << "\n";
+    }
+
+    o << "一、请旨（待圣裁）。\n";
+    int pl = 0;
+    for (const std::string& a : s.openAsks) { o << "  " << a << "\n"; ++pl; }
+    for (const std::string& t : s.humanTasks) { o << "  " << t << " — 须 human 圣裁\n"; ++pl; }
+    if (pl == 0) o << "  （无事请旨）\n";
+
+    o << "一、臣工在值。";
+    if (s.activeAgents.empty()) {
+        o << "（空朝，无人当值）";
+    } else {
+        for (size_t i = 0; i < s.activeAgents.size(); ++i) {
+            if (i) o << "、";
+            o << s.activeAgents[i];
+        }
+    }
+    o << "\n如蒙圣鉴，谨此奏闻。\n";
+    return o.str();
+}
+
+}  // namespace
+
+std::string RoomStore::genReport(const std::string& room, const std::string& mode) {
+    if (mode != "hzdf" && mode != "company" && mode != "feudal")
+        throw std::runtime_error("unknown report mode: " + mode + " (hzdf|company|feudal)");
+    std::lock_guard<std::mutex> lock(mu_);
+    RoomData& rd = load(room);  // throws on unknown room
+    sweepExpired(room, rd);
+
+    ReportSnap s;
+    s.room = room;
+    s.chamber = rd.meta.chamber;
+    s.hasGoal = rd.soc.goal.exists;
+    s.goalText = rd.soc.goal.text;
+    s.goalStatus = rd.soc.goal.status;
+    s.goalCriteria = rd.soc.goal.criteria;
+    s.genCount = (int)rd.soc.gens.size();
+    s.activeGen = currentGenLocked(rd);
+
+    for (const Generation& g : rd.soc.gens) {
+        ReportSnap::Phase p;
+        p.n = g.n;
+        p.active = (g.n == s.activeGen);
+        p.chronicle = g.chronicle;
+        for (const Task& t : rd.tasks)
+            if (t.gen == g.n) {
+                ++p.total;
+                if (t.status == "done") ++p.done;
+            }
+        s.phases.push_back(p);
+    }
+
+    for (const Task& t : rd.tasks) {
+        if (t.status == "done") {
+            ++s.tDone;
+            s.doneTasks.push_back("#" + std::to_string(t.id) + " " + t.title + " — " +
+                                  t.assignee + "贡，" + t.verifier + "验讫");
+            if (!t.assignee.empty()) ++s.byAgentDone[t.assignee];
+        } else if (t.status == "claimed" || t.status == "submitted") {
+            ++s.tInFlight;
+            s.inFlightTasks.push_back("#" + std::to_string(t.id) + "【交战·" +
+                                      t.assignee + "领兵】" + t.title);
+            if (!t.assignee.empty()) ++s.byAgentInFlight[t.assignee];
+        } else {
+            ++s.tOpen;
+            s.openTasks.push_back("#" + std::to_string(t.id) + " " + t.title);
+        }
+        if (t.human && t.status != "done") {
+            ++s.tHuman;
+            s.humanTasks.push_back("#" + std::to_string(t.id) + " " + t.title);
+        }
+    }
+
+    for (const RoleEntry& r : rd.soc.roles) s.agentPost[r.agent] = r.role;
+
+    std::set<long long> answered;
+    for (const Message& m : rd.msgs) {
+        if (m.type == "fact") {
+            ++s.facts;
+            if (s.recentFacts.size() < 3)
+                s.recentFacts.push_back(m.agent + "：" + utf8Truncate(m.content, 80));
+        } else if (m.type == "answer" && m.ref > 0) {
+            answered.insert(m.ref);
+        }
+    }
+    // newest-first recentFacts (messages arrive oldest-first)
+    std::reverse(s.recentFacts.begin(), s.recentFacts.end());
+    for (const Message& m : rd.msgs) {
+        if (m.type != "ask" || answered.count(m.id)) continue;
+        s.openAsks.push_back("ask #" + std::to_string(m.id) + " (" + m.agent +
+                             "): " + utf8Truncate(m.content, 80));
+    }
+    // newest asks first (they are the pressing ones)
+    std::reverse(s.openAsks.begin(), s.openAsks.end());
+
+    long long cutoff = nowMs() - 1800000;
+    std::set<std::string> act;
+    for (const Claim& c : rd.claims)
+        if (c.active && c.agent != "server") { act.insert(c.agent); ++s.activeClaims; }
+    for (const Message& m : rd.msgs)
+        if (m.ts >= cutoff && m.agent != "server") act.insert(m.agent);
+    for (const Task& t : rd.tasks)
+        if ((t.status == "claimed" || t.status == "submitted") && !t.assignee.empty())
+            act.insert(t.assignee);
+    s.activeAgents.assign(act.begin(), act.end());
+    s.answeredAsks = (int)answered.size();
+
+    if (mode == "hzdf") return renderHzdf(s);
+    if (mode == "company") return renderCompany(s);
+    return renderFeudal(s);
+}
+
 
 Message RoomStore::say(const std::string& room, const std::string& agent,
                        const std::string& type, const std::string& content,
@@ -500,7 +1102,8 @@ std::vector<Message> RoomStore::waitMessages(const std::string& room, long long 
 }
 
 std::vector<SearchHit> RoomStore::search(const std::string& query,
-                                         const std::string& roomFilter, int limit) {
+                                         const std::string& roomFilter, int limit,
+                                         const std::string& viewer) {
     if (limit <= 0) limit = 50;
     if (limit > 500) limit = 500;
     std::string needle = asciiLower(query);
@@ -510,6 +1113,13 @@ std::vector<SearchHit> RoomStore::search(const std::string& query,
     for (const std::string& room : rooms()) {
         if (!roomFilter.empty() && room != roomFilter) continue;
         RoomData& rd = load(room);
+        // Chambers are invisible to non-members even when named explicitly.
+        if (rd.meta.chamber) {
+            bool member = false;
+            for (const std::string& m : rd.meta.members)
+                if (m == viewer) member = true;
+            if (!member) continue;
+        }
         for (auto it = rd.msgs.rbegin(); it != rd.msgs.rend(); ++it) {
             std::string hay = asciiLower(it->content + "\n" + it->agent + "\n" + it->type);
             if (hay.find(needle) == std::string::npos) continue;
@@ -630,12 +1240,13 @@ Task RoomStore::taskVerify(const std::string& room, long long id, const std::str
             throw std::runtime_error("task #" + std::to_string(id) +
                                       " awaits human sign-off — only the agent 'human' may verify "
                                       "it");
-    } else if (!rd.soc.roles.empty() && agent != "human" && !hasVerifyRoleLocked(rd, agent)) {
-        // The division-of-labor gate: once roles are registered, only the
-        // reviewer and tester roles may verify (the sovereign 'human' excepted).
+    } else if (!rd.soc.roles.empty() && agent != "human" &&
+               !canVerifyTaskLocked(rd, agent)) {
+        // The division-of-labor gate: once roles are registered, only posts
+        // carrying the verify-task bit may verify (sovereign 'human' excepted).
         throw std::runtime_error("task #" + std::to_string(id) +
-                                  " verification requires the reviewer or tester role while "
-                                  "roles are registered");
+                                  " verification requires a post with the verify-task bit "
+                                  "while roles are registered");
     }
     t->verifier = agent;
     t->updatedTs = nowMs();
@@ -870,9 +1481,36 @@ int RoomStore::currentGenLocked(const RoomData& rd) const {
     return rd.soc.gens.back().n;
 }
 
-bool RoomStore::hasVerifyRoleLocked(const RoomData& rd, const std::string& agent) const {
-    for (const RoleEntry& r : rd.soc.roles)
-        if (r.agent == agent && (r.role == "reviewer" || r.role == "tester")) return true;
+// The effective post table: the five presets plus the room's custom posts.
+std::vector<PostDef> RoomStore::effectivePostsLocked(const RoomData& rd) {
+    std::vector<PostDef> out;
+    for (const PostBits& p : kPresets) {
+        PostDef d;
+        d.name = p.name;
+        d.canVerifyTask = p.vt;
+        d.canVerifyGoal = p.vg;
+        d.preset = true;
+        out.push_back(d);
+    }
+    for (const PostDef& c : rd.soc.posts) out.push_back(c);
+    return out;
+}
+
+bool RoomStore::canVerifyTaskLocked(const RoomData& rd, const std::string& agent) const {
+    for (const PostDef& p : effectivePostsLocked(rd)) {
+        if (!p.canVerifyTask) continue;
+        for (const RoleEntry& r : rd.soc.roles)
+            if (r.agent == agent && r.role == p.name) return true;
+    }
+    return false;
+}
+
+bool RoomStore::canVerifyGoalLocked(const RoomData& rd, const std::string& agent) const {
+    for (const PostDef& p : effectivePostsLocked(rd)) {
+        if (!p.canVerifyGoal) continue;
+        for (const RoleEntry& r : rd.soc.roles)
+            if (r.agent == agent && r.role == p.name) return true;
+    }
     return false;
 }
 
@@ -1024,9 +1662,9 @@ void RoomStore::goalVerify(const std::string& room, const std::string& agent, bo
         throw std::runtime_error("the god goal cannot be verified by its own achiever — "
                                  "evidence gate");
     // The sovereign 'human' passes the division-of-labor gate unconditionally.
-    if (!rd.soc.roles.empty() && agent != "human" && !hasVerifyRoleLocked(rd, agent))
-        throw std::runtime_error("god-goal verification requires the reviewer or tester role "
-                                 "while roles are registered");
+    if (!rd.soc.roles.empty() && agent != "human" && !canVerifyGoalLocked(rd, agent))
+        throw std::runtime_error("god-goal verification requires a post with the verify-goal "
+                                 "bit while roles are registered");
     Goal& g = rd.soc.goal;
     if (accept) {
         // The oracle gate: with an oracle declared, the society cannot close
@@ -1126,17 +1764,17 @@ void RoomStore::genChronicle(const std::string& room, const std::string& agent,
 
 void RoomStore::roleTake(const std::string& room, const std::string& agent,
                          const std::string& role) {
-    static const char* roles[] = {"commander", "recorder", "executor", "reviewer", "tester",
-                                  nullptr};
     std::lock_guard<std::mutex> lock(mu_);
     if (agent.empty() || agent.size() > 64) throw std::runtime_error("bad agent name");
-    bool ok = false;
-    for (int i = 0; roles[i]; i++)
-        if (role == roles[i]) ok = true;
-    if (!ok)
-        throw std::runtime_error("unknown role: " + role +
-                                 " (commander|recorder|executor|reviewer|tester)");
     RoomData& rd = load(room);
+    if (!isPresetPost(role)) {
+        bool known = false;
+        for (const PostDef& p : rd.soc.posts)
+            if (p.name == role) known = true;
+        if (!known)
+            throw std::runtime_error("unknown post: " + role +
+                                     " — define it first (society post-define)");
+    }
     for (const RoleEntry& r : rd.soc.roles)
         if (r.role == role && r.agent == agent) return;  // idempotent
     RoleEntry r;
@@ -1145,7 +1783,44 @@ void RoomStore::roleTake(const std::string& room, const std::string& agent,
     r.ts = nowMs();
     rd.soc.roles.push_back(r);
     persistSociety(room, rd);
-    sayLocked(room, "server", "role", agent + " took role " + role, -1);
+    sayLocked(room, "server", "role", agent + " took post " + role, -1);
+}
+
+void RoomStore::postDefine(const std::string& room, const std::string& name,
+                            bool canVerifyTask, bool canVerifyGoal,
+                            const std::string& model, const std::string& agent) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (agent.empty() || agent.size() > 64) throw std::runtime_error("bad agent name");
+    if (model.size() > 128) throw std::runtime_error("model too long (max 128)");
+    if (!validPostName(name))
+        throw std::runtime_error("bad post name (1..32 chars of [A-Za-z0-9-_.])");
+    if (isPresetPost(name))
+        throw std::runtime_error("post name reserved by a preset: " + name);
+    RoomData& rd = load(room);
+    for (const PostDef& p : rd.soc.posts)
+        if (p.name == name)
+            throw std::runtime_error("post already defined: " + name);
+    PostDef p;
+    p.name = name;
+    p.canVerifyTask = canVerifyTask;
+    p.canVerifyGoal = canVerifyGoal;
+    p.model = model;
+    p.createdBy = agent;
+    p.createdTs = nowMs();
+    p.preset = false;
+    rd.soc.posts.push_back(p);
+    persistSociety(room, rd);
+    sayLocked(room, "server", "role",
+              agent + " defined post " + name +
+                  " (verify-task: " + (canVerifyTask ? "yes" : "no") +
+                  ", verify-goal: " + (canVerifyGoal ? "yes" : "no") +
+                  (model.empty() ? "" : ", model: " + model) + ")",
+              -1);
+}
+
+std::vector<PostDef> RoomStore::posts(const std::string& room) {
+    std::lock_guard<std::mutex> lock(mu_);
+    return effectivePostsLocked(load(room));
 }
 
 // -----------------------------------------------------------------------------

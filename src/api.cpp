@@ -1,6 +1,9 @@
 // api.cpp — see api.h. Routes (all JSON):
 //   GET  /v1/status
-//   GET  /v1/rooms                        POST /v1/rooms {"name"}
+//   GET  /v1/agents                        POST /v1/agents {"name","key"}
+//   GET  /v1/rooms                          POST /v1/rooms {"name","chamber"?}
+//         (chamber=true requires verified identity headers — the creator
+//          becomes the first member; chambers are hidden from non-members)
 //   GET  /v1/rooms/{r}/messages?since&limit&type&agent
 //   GET  /v1/rooms/{r}/wait?since&timeout_ms      (long-poll, blocks)
 //   POST /v1/rooms/{r}/say                {"agent","type","content","ref"?}
@@ -10,7 +13,11 @@
 //   GET  /v1/rooms/{r}/board              GET/PUT /v1/rooms/{r}/board/{key}
 //   GET  /v1/rooms/{r}/tasks              POST /v1/rooms/{r}/tasks {"title",...,"human"?}
 //   POST /v1/rooms/{r}/tasks/{id}/claim|submit|verify
-//   GET  /v1/rooms/{r}/society
+//   GET  /v1/rooms/{r}/society            (+ posts, activeAgents)
+//   GET  /v1/rooms/{r}/population         (activeAgents — the 5-10/≥3 signal)
+//   GET  /v1/rooms/{r}/members            POST /v1/rooms/{r}/members {"agent"}
+//   GET  /v1/rooms/{r}/posts               POST /v1/rooms/{r}/posts
+//         {"name","canVerifyTask"?,"canVerifyGoal"?,"model"?,"agent"}
 //   POST /v1/rooms/{r}/goal                GET /v1/rooms/{r}/goal
 //   POST /v1/rooms/{r}/goal/achieve|verify|abandon
 //         (verify accept: the server fetches the goal's oracle, if declared,
@@ -21,6 +28,11 @@
 //   GET  /v1/rooms/{r}/verify
 //   GET  /v1/search?q&room&limit
 //   GET  /                                (web UI shell, no auth)
+//
+// Identity: X-GR-Agent + X-GR-Key headers (key verified against the
+// server-global registry; only its SHA-256 is stored). In a chamber every
+// route requires a verified identity, the acting agent must equal it, and
+// non-members see 404.
 #include "api.h"
 
 #include <stdexcept>
@@ -159,6 +171,27 @@ Json roleJson(const RoleEntry& r) {
     return j;
 }
 
+Json postJson(const PostDef& p) {
+    Json j = Json::object();
+    j.set("name", Json::string(p.name));
+    j.set("canVerifyTask", Json::boolean(p.canVerifyTask));
+    j.set("canVerifyGoal", Json::boolean(p.canVerifyGoal));
+    j.set("model", Json::string(p.model));
+    j.set("createdBy", Json::string(p.createdBy));
+    j.set("createdTs", Json::number(static_cast<double>(p.createdTs)));
+    j.set("preset", Json::boolean(p.preset));
+    return j;
+}
+
+Json populationJson(const Population& p) {
+    Json arr = Json::array();
+    for (const std::string& a : p.active) arr.push(Json::string(a));
+    Json j = Json::object();
+    j.set("activeAgents", std::move(arr));
+    j.set("windowMs", Json::number(static_cast<double>(p.windowMs)));
+    return j;
+}
+
 int activeGen(const Society& s) {
     if (s.gens.empty() || s.gens.back().status != "active") return 0;
     return s.gens.back().n;
@@ -179,6 +212,25 @@ bool splitRoomPath(const std::string& path, std::string& room, std::string& rest
         rest = tail.substr(slash + 1);
     }
     return !room.empty();
+}
+
+// Agent identity carried by X-GR-Agent/X-GR-Key headers. present: headers
+// were sent at all; ok: name registered and key matched; name: claimed name.
+struct Identity {
+    bool present = false;
+    bool ok = false;
+    std::string name;
+};
+
+Identity parseIdentity(const HttpRequest& req, RoomStore& store) {
+    Identity id;
+    auto a = req.headers.find("x-gr-agent");
+    auto k = req.headers.find("x-gr-key");
+    if (a == req.headers.end() || k == req.headers.end()) return id;
+    id.present = true;
+    id.name = a->second;
+    id.ok = store.agentCheck(id.name, k->second);
+    return id;
 }
 
 }  // namespace
@@ -206,10 +258,40 @@ HttpHandler makeApiRouter(RoomStore& store, const std::string& token) {
             return json(200, j);
         }
 
-        if (p == "/v1/rooms") {
+        if (p == "/v1/agents") {
             if (req.method == "GET") {
                 Json arr = Json::array();
-                for (const std::string& r : store.rooms()) arr.push(Json::string(r));
+                for (const std::string& a : store.agentList()) arr.push(Json::string(a));
+                Json j = Json::object();
+                j.set("agents", std::move(arr));
+                return json(200, j);
+            }
+            if (req.method == "POST") {
+                Json body;
+                if (!parseBody(req, body)) return err(400, "body must be a JSON object");
+                std::string name = strField(body, "name");
+                std::string key = strField(body, "key");
+                try {
+                    store.agentRegister(name, key);
+                } catch (const std::exception& e) {
+                    return err(400, e.what());
+                }
+                Json j = Json::object();
+                j.set("registered", Json::string(name));
+                return json(200, j);
+            }
+            return err(405, "method not allowed");
+        }
+
+        if (p == "/v1/rooms") {
+            Identity id = parseIdentity(req, store);
+            if (req.method == "GET") {
+                // Chambers are invisible to non-members; viewer = verified
+                // identity, or "" (sees only open rooms).
+                std::string viewer = id.ok ? id.name : "";
+                Json arr = Json::array();
+                for (const std::string& r : store.visibleRooms(viewer))
+                    arr.push(Json::string(r));
                 Json j = Json::object();
                 j.set("rooms", std::move(arr));
                 return json(200, j);
@@ -218,10 +300,21 @@ HttpHandler makeApiRouter(RoomStore& store, const std::string& token) {
                 Json body;
                 if (!parseBody(req, body)) return err(400, "body must be a JSON object");
                 std::string name = strField(body, "name");
+                bool chamber = false;
+                if (const Json* c = body.get("chamber"); c && c->isBool()) chamber = c->b;
                 if (!validRoomName(name)) return err(400, "invalid room name");
-                if (!store.createRoom(name)) return err(409, "room exists");
+                if (chamber) {
+                    if (!id.present || !id.ok)
+                        return err(403, "creating a chamber requires verified identity "
+                                        "headers (X-GR-Agent/X-GR-Key)");
+                    if (!store.createRoom(name, true, id.name))
+                        return err(409, "room exists");
+                } else {
+                    if (!store.createRoom(name)) return err(409, "room exists");
+                }
                 Json j = Json::object();
                 j.set("created", Json::string(name));
+                j.set("chamber", Json::boolean(chamber));
                 return json(200, j);
             }
             return err(405, "method not allowed");
@@ -230,6 +323,31 @@ HttpHandler makeApiRouter(RoomStore& store, const std::string& token) {
         std::string room, rest;
         if (splitRoomPath(p, room, rest)) {
             if (!store.roomExists(room)) return err(404, "unknown room: " + room);
+            Identity id = parseIdentity(req, store);
+            RoomMeta meta = store.roomMeta(room);
+            if (meta.chamber) {
+                // Every route inside a chamber is identity-bound and
+                // member-only. Unverified callers get 403, non-members 404
+                // (existence hidden).
+                if (!id.present || !id.ok)
+                    return err(403, "chamber rooms require verified identity "
+                                    "(X-GR-Agent/X-GR-Key)");
+                if (!store.canView(room, id.name))
+                    return err(404, "unknown room: " + room);
+                // Action binding: every mutating request's body agent must
+                // equal the verified identity (explicitly — the "anon"
+                // default will not pass). Member-add is exempt: its body agent
+                // names the member being added, the actor is the caller.
+                if ((req.method == "POST" || req.method == "PUT") && rest != "members") {
+                    Json body;
+                    if (!Json::parse(req.body, body) || !body.isObj())
+                        return err(400, "body must be a JSON object");
+                    const Json* a = body.get("agent");
+                    if (!a || !a->isStr() || a->str != id.name)
+                        return err(403, "chamber actions are identity-bound — body agent "
+                                        "must equal the verified identity (" + id.name + ")");
+                }
+            }
 
             if (rest == "messages" && req.method == "GET") {
                 long long since = 0;
@@ -459,6 +577,95 @@ HttpHandler makeApiRouter(RoomStore& store, const std::string& token) {
             }
 
             // ---- society layer ---------------------------------------------
+            if (rest == "population" && req.method == "GET") {
+                Json j = populationJson(store.population(room));
+                j.set("room", Json::string(room));
+                return json(200, j);
+            }
+
+            // Reporting modes: hzdf (Dengyun default, HZDF-2026 shape),
+            // company, feudal (Lanshan additions). Read-only render.
+            if (rest == "report" && req.method == "GET") {
+                std::string mode = "hzdf";
+                auto it = req.query.find("mode");
+                if (it != req.query.end() && !it->second.empty()) mode = it->second;
+                try {
+                    Json j = Json::object();
+                    j.set("room", Json::string(room));
+                    j.set("mode", Json::string(mode));
+                    j.set("report", Json::string(store.genReport(room, mode)));
+                    return json(200, j);
+                } catch (const std::exception& e) {
+                    return err(400, e.what());
+                }
+            }
+
+            if (rest == "members") {
+                if (req.method == "GET") {
+                    RoomMeta m = store.roomMeta(room);
+                    if (!m.chamber)
+                        return err(400, "not a chamber room — membership guards chambers only");
+                    Json arr = Json::array();
+                    for (const std::string& a : m.members) arr.push(Json::string(a));
+                    Json j = Json::object();
+                    j.set("room", Json::string(room));
+                    j.set("members", std::move(arr));
+                    return json(200, j);
+                }
+                if (req.method == "POST") {
+                    Json body;
+                    if (!parseBody(req, body)) return err(400, "body must be a JSON object");
+                    std::string agent = strField(body, "agent");
+                    if (agent.empty()) return err(400, "missing agent to add");
+                    // The caller is the verified identity (chamber-gated above).
+                    try {
+                        store.memberAdd(room, id.name, agent);
+                    } catch (const std::exception& e) {
+                        return err(400, e.what());
+                    }
+                    RoomMeta m = store.roomMeta(room);
+                    Json arr = Json::array();
+                    for (const std::string& a : m.members) arr.push(Json::string(a));
+                    Json j = Json::object();
+                    j.set("room", Json::string(room));
+                    j.set("members", std::move(arr));
+                    return json(200, j);
+                }
+                return err(405, "method not allowed");
+            }
+
+            if (rest == "posts") {
+                if (req.method == "GET") {
+                    Json arr = Json::array();
+                    for (const PostDef& p : store.posts(room)) arr.push(postJson(p));
+                    Json j = Json::object();
+                    j.set("room", Json::string(room));
+                    j.set("posts", std::move(arr));
+                    return json(200, j);
+                }
+                if (req.method == "POST") {
+                    Json body;
+                    if (!parseBody(req, body)) return err(400, "body must be a JSON object");
+                    bool vt = false, vg = false;
+                    if (const Json* b = body.get("canVerifyTask"); b && b->isBool()) vt = b->b;
+                    if (const Json* b = body.get("canVerifyGoal"); b && b->isBool()) vg = b->b;
+                    try {
+                        store.postDefine(room, strField(body, "name"), vt, vg,
+                                          strField(body, "model"),
+                                          strField(body, "agent", "anon"));
+                    } catch (const std::exception& e) {
+                        return err(400, e.what());
+                    }
+                    Json arr = Json::array();
+                    for (const PostDef& p : store.posts(room)) arr.push(postJson(p));
+                    Json j = Json::object();
+                    j.set("room", Json::string(room));
+                    j.set("posts", std::move(arr));
+                    return json(200, j);
+                }
+                return err(405, "method not allowed");
+            }
+
             if (rest == "society" && req.method == "GET") {
                 Society s = store.society(room);
                 Json j = Json::object();
@@ -471,6 +678,13 @@ HttpHandler makeApiRouter(RoomStore& store, const std::string& token) {
                 Json roles = Json::array();
                 for (const RoleEntry& r : s.roles) roles.push(roleJson(r));
                 j.set("roles", std::move(roles));
+                Json posts = Json::array();
+                for (const PostDef& p : store.posts(room)) posts.push(postJson(p));
+                j.set("posts", std::move(posts));
+                Population pop = store.population(room);
+                Json act = Json::array();
+                for (const std::string& a : pop.active) act.push(Json::string(a));
+                j.set("activeAgents", std::move(act));
                 return json(200, j);
             }
 
@@ -655,8 +869,12 @@ HttpHandler makeApiRouter(RoomStore& store, const std::string& token) {
                 }
             }
             if (q.empty()) return err(400, "missing q");
+            // Chambers never leak into search for non-members: the viewer is
+            // the verified identity (or anonymous — open rooms only).
+            Identity id = parseIdentity(req, store);
+            std::string viewer = id.ok ? id.name : "";
             Json arr = Json::array();
-            for (const SearchHit& h : store.search(q, roomF, limit)) {
+            for (const SearchHit& h : store.search(q, roomF, limit, viewer)) {
                 Json j = msgJson(h.msg);
                 j.set("room", Json::string(h.room));
                 arr.push(std::move(j));

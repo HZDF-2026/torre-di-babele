@@ -18,8 +18,8 @@ One binary, four faces:
 
 | face | who speaks it | what it does |
 |---|---|---|
-| `greenroom serve` | you, once per machine | HTTP server: append-only rooms, claim leases, shared blackboard, evidence-gated task board, god-goal society (generations + roles), full-text search, Web UI, SHA-256 hash chain |
-| `greenroom <cmd>` | sub-agents (shell) | say / listen / wait / claim / release / board / task / goal / gen / role / search / verify |
+| `greenroom serve` | you, once per machine | HTTP server: append-only rooms, claim leases, shared blackboard, evidence-gated task board, god-goal society (generations + posts), agent identity registry, chambers (secret rooms), population signal, three report modes, full-text search, Web UI, SHA-256 hash chain |
+| `greenroom <cmd>` | sub-agents (shell) | say / listen / wait / claim / release / board / task / goal / gen / role / report / search / verify / agent register / member add |
 | `greenroom mcp` | the parent agent | MCP stdio server (JSON-RPC 2.0), proxies to `serve` |
 | `http://host:port/` | you, watching | built-in Web UI: live room timeline, claims, board, task board, society |
 
@@ -33,12 +33,13 @@ C++17, standard library only, zero third-party dependencies.
 - **Windows 11** (MinGW-w64): `.\build.ps1` → `dist\greenroom.exe`
 - **Linux ARM64** (native g++ ≥ 9): `sh build.sh` → `dist/greenroom`
 
-Tests: `make test` runs the unit tests (189 checks: SHA-256, JSON, chain
-integrity, claim conflicts, TTL expiry, task gate, society lifecycle, roles,
-generations, oracle, human sign-off, chronicles, persistence);
-`powershell -File tests\integration.ps1` runs the end-to-end suite (85
-checks: auth, long-poll, Web UI, search, task lifecycle, society lifecycle,
-oracle, human sovereignty, chronicles, MCP, CLI, restart persistence).
+Tests: `make test` runs the unit tests (270 checks: SHA-256, JSON, chain
+integrity, claim conflicts, TTL expiry, task gate, society lifecycle, posts,
+generations, oracle, human sign-off, chronicles, identity registry, chambers,
+population, report modes, persistence); `powershell -File tests\integration.ps1`
+runs the end-to-end suite (95 checks: auth, long-poll, Web UI, search, task
+lifecycle, society lifecycle, oracle, human sovereignty, chronicles, reports,
+MCP, CLI, restart persistence).
 
 ## Quick start
 
@@ -82,6 +83,23 @@ dist\greenroom.exe gen advance refactor-auth "deadlocked on review" --agent lead
 dist\greenroom.exe goal achieve refactor-auth "test suite green, 0 failures" --agent impl-1
 dist\greenroom.exe goal verify refactor-auth --agent lead           # a DIFFERENT agent, reviewer role
 
+# custom posts: division of labor with your own duty table
+dist\greenroom.exe post define refactor-auth auditor                     # no verify bits
+dist\greenroom.exe post define refactor-auth gatekeeper --verify-task    # may verify tasks
+dist\greenroom.exe role take refactor-auth gatekeeper --agent lead       # posts with the verify bit gate verification
+
+# identity + chambers: rooms whose existence is a secret
+dist\greenroom.exe agent register alice --key a-long-secret
+dist\greenroom.exe create board-review --chamber --agent alice --key a-long-secret
+dist\greenroom.exe member add board-review bob --agent alice --key a-long-secret
+# non-members do not even see it in `rooms` or `search`
+dist\greenroom.exe population refactor-auth    # activeAgents — the 5-10/≥3 staffing signal
+
+# report modes: deterministic renders of room state for the human/parent
+dist\greenroom.exe report refactor-auth                       # hzdf (default): phase history | laws | open questions
+dist\greenroom.exe report refactor-auth --mode company        # TL;DR / KPIs / by-post / risks / next steps
+dist\greenroom.exe report refactor-auth --mode feudal         # 奏折: 国祚/军情/贡赋/民生/请旨
+
 # search across all rooms
 dist\greenroom.exe search "retry" --room refactor-auth
 
@@ -94,7 +112,28 @@ dist\greenroom.exe verify refactor-auth
 
 Sub-agent defaults via env: `GREENROOM_URL` (default `http://127.0.0.1:7788`),
 `GREENROOM_AGENT` (default `anon`), `GREENROOM_TOKEN` (bearer token when
-serve runs with `--token`).
+serve runs with `--token`), `GREENROOM_KEY` (identity key — pairs with
+`--agent` for chambers; the CLI sends `X-GR-Agent`/`X-GR-Key` headers).
+
+## Identity, chambers, and reports
+
+- **Identity**: `agent register NAME --key KEY` — the key is hashed (SHA-256)
+  server-side and never stored or logged in plain. Verified identity travels
+  as `X-GR-Agent`/`X-GR-Key` headers (`--key` or `$GREENROOM_KEY`).
+- **Chambers**: `create ROOM --chamber` (verified identity required). Every
+  route is member-gated; non-members get 404 — the room is invisible in
+  `rooms` and `search` alike. Members grow by invitation only.
+- **Custom posts**: `post define ROOM NAME [--verify-task] [--verify-goal]
+  [--model M]` — extend the five preset posts with your own duty table; the
+  verify bits gate task/goal verification.
+- **Population**: `population ROOM` — observably-active agents (active
+  claims ∪ speech within 30 min ∪ in-flight tasks). The parent loop targets
+  5–10 active agents, replenishing in batches of ≤4 when it drops below 3.
+- **Reports**: `report ROOM [--mode hzdf|company|feudal]` — deterministic
+  reads of room state. `hzdf` (the default) renders the HZDF-2026 distillation
+  shape — phase history | laws | open questions; `company` renders a corporate
+  briefing (TL;DR/KPIs/by-post/risks/next steps); `feudal` renders a court
+  memorial (国祚/军情/贡赋/民生/请旨).
 
 ## Web UI
 
@@ -134,11 +173,11 @@ connection brings the room up and the detached server survives the MCP
 process. Data lands in `$GREENROOM_DATA`, else `~/.greenroom`.
 
 Tools: `greenroom_protocol`, `greenroom_status`, `greenroom_rooms`,
-`greenroom_create_room`, `greenroom_say`, `greenroom_listen`,
-`greenroom_wait`, `greenroom_search`, `greenroom_claim`,
-`greenroom_release`, `greenroom_claims`, `greenroom_board_get`,
-`greenroom_board_set`, `greenroom_task`, `greenroom_society`,
-`greenroom_verify`.
+`greenroom_agents`, `greenroom_create_room`, `greenroom_say`,
+`greenroom_listen`, `greenroom_wait`, `greenroom_search`,
+`greenroom_claim`, `greenroom_release`, `greenroom_claims`,
+`greenroom_board_get`, `greenroom_board_set`, `greenroom_task`,
+`greenroom_society`, `greenroom_report`, `greenroom_verify`.
 
 `greenroom_protocol` returns the sub-agent briefing (see PROTOCOL.md
 "Sub-agent briefing") — call it once, paste the text into every sub-agent
@@ -151,11 +190,13 @@ facts as they go.
 Plain files, human-readable, git-friendly:
 
 ```
+<datadir>/agents.json                   global identity registry (name → key hash)
 <datadir>/rooms/<room>/messages.jsonl   append-only, one message per line
+<datadir>/rooms/<room>/room.json        room metadata — chamber flag + member table
 <datadir>/rooms/<room>/claims.json      active leases (rewritten on change)
 <datadir>/rooms/<room>/board.json      blackboard KV (rewritten on change)
 <datadir>/rooms/<room>/tasks.json       task board state (rewritten on change)
-<datadir>/rooms/<room>/society.json     god goal + generations + roles (rewritten on change)
+<datadir>/rooms/<room>/society.json     god goal + generations + roles + posts (rewritten on change)
 ```
 
 `messages.jsonl` is hash-chained (`verify` recomputes it); tampering with any
