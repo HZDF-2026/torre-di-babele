@@ -22,6 +22,7 @@ One binary, four faces:
 | `babele serve` | you, once per machine | HTTP server: append-only rooms, claim leases, shared blackboard, evidence-gated task board, god-goal society (generations + posts), agent identity registry, chambers (secret rooms), population signal, three report modes, full-text search, Web UI, SHA-256 hash chain |
 | `babele <cmd>` | sub-agents (shell) | say / listen / wait / claim / release / board / task / goal / gen / role / report / search / verify / agent register / member add |
 | `babele mcp` | the parent agent | MCP stdio server (JSON-RPC 2.0), proxies to `serve` |
+| `babele selfhash` | anyone | SHA-256 of the executable itself — compare against the release digest to confirm the binary is untampered |
 | `http://host:port/` | you, watching | built-in Web UI: live room timeline, claims, board, task board, society |
 
 Full protocol, message types, claim semantics, task gate, and the sub-agent

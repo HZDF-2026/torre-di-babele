@@ -17,9 +17,11 @@ BUILD := build
 DIST := dist
 
 SRCS := src/util.cpp src/sha256.cpp src/jsjson.cpp src/store.cpp src/http.cpp \
-        src/api.cpp src/mcp.cpp src/cli.cpp src/main.cpp
+        src/api.cpp src/mcp.cpp src/cli.cpp src/main.cpp \
+        src/protect/vm.cpp src/protect/auth.cpp src/protect/integrity.cpp
 LIB_SRCS := src/util.cpp src/sha256.cpp src/jsjson.cpp src/store.cpp src/http.cpp \
-            src/api.cpp src/mcp.cpp src/cli.cpp
+            src/api.cpp src/mcp.cpp src/cli.cpp \
+            src/protect/vm.cpp src/protect/auth.cpp src/protect/integrity.cpp
 OBJS := $(addprefix $(BUILD)/,$(notdir $(SRCS:.cpp=.o)))
 LIB_OBJS := $(addprefix $(BUILD)/,$(notdir $(LIB_SRCS:.cpp=.o)))
 
@@ -38,7 +40,7 @@ FIXPATH = $1
 LDLIBS := -lpthread
 endif
 
-vpath %.cpp src
+vpath %.cpp src src/protect
 
 .PHONY: all test clean
 
@@ -56,8 +58,10 @@ $(BUILD)/%.o: %.cpp | $(BUILD)
 test: $(TEST_BIN)
 	$(TEST_BIN)
 
-$(TEST_BIN): tests/test_unit.cpp $(BUILD)/util.o $(BUILD)/sha256.o $(BUILD)/jsjson.o $(BUILD)/store.o $(BUILD)/http.o | $(BUILD)
-	$(CXX) $(CXXFLAGS) -Isrc tests/test_unit.cpp $(BUILD)/util.o $(BUILD)/sha256.o $(BUILD)/jsjson.o $(BUILD)/store.o $(BUILD)/http.o -o $@ $(LDLIBS)
+$(TEST_BIN): tests/test_unit.cpp $(BUILD)/util.o $(BUILD)/sha256.o $(BUILD)/jsjson.o \
+             $(BUILD)/store.o $(BUILD)/http.o $(BUILD)/vm.o $(BUILD)/auth.o \
+             $(BUILD)/integrity.o | $(BUILD)
+	$(CXX) $(CXXFLAGS) -Isrc tests/test_unit.cpp $(BUILD)/util.o $(BUILD)/sha256.o $(BUILD)/jsjson.o $(BUILD)/store.o $(BUILD)/http.o $(BUILD)/vm.o $(BUILD)/auth.o $(BUILD)/integrity.o -o $@ $(LDLIBS)
 
 clean:
 	-$(RMRF) $(call FIXPATH,$(BUILD))

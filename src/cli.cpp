@@ -10,6 +10,7 @@
 #include "http.h"
 #include "jsjson.h"
 #include "mcp.h"
+#include "protect/integrity.h"
 #include "store.h"
 #include "util.h"
 
@@ -59,6 +60,7 @@ void usage() {
               << "  babele role  list ROOM\n"
               << "  babele verify ROOM\n"
               << "  babele mcp\n"
+              << "  babele selfhash\n"
               << "\n"
               << "types: say plan fact ask answer done task goal gen role\n"
               << "posts: commander recorder executor reviewer tester + custom (post define)\n"
@@ -312,6 +314,17 @@ int runCli(const std::vector<std::string>& args) {
         return 0;
     }
     if (cmd == "mcp") return runMcp();
+    if (cmd == "selfhash") {
+        // SHA-256 of this executable — compare against the release digest to
+        // verify the binary is untampered (PROTOCOL.md §Protection).
+        std::string h = selfSha256();
+        if (h.empty()) {
+            std::cerr << "error: cannot read own executable image\n";
+            return 1;
+        }
+        std::cout << h << "\n";
+        return 0;
+    }
     {
         Parsed p;
         if (!parseArgs(rest, p, {"port", "data", "bind", "token", "agent", "ref", "since",

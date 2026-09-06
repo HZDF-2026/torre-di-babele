@@ -511,6 +511,33 @@ Plain files on purpose: human-readable, git-friendly, easy to archive with a
 session. `messages.jsonl` never shrinks; `claims.json` / `board.json` /
 `tasks.json` / `society.json` are current-state snapshots.
 
+## Protection (BVM)
+
+The engine is open source (Apache-2.0); the published binary is still worth
+guarding against two local attacks: patching the auth check open, and running
+a tampered binary that lies about who wrote what. v0.6.0 adds a protection
+layer under `src/protect/`:
+
+- **BVM — the Babele VM** (`vm.h/.cpp`): a small fixed-width bytecode
+  interpreter (16 x u64 registers, unsigned compare flags, 21 opcodes, 2
+  syscalls). Security-critical decisions are compiled to BVM bytecode and
+  executed here, so the shipped binary contains no native `cmp/je` sequence at
+  the authentication site to flip with a one-byte patch.
+- **Auth in bytecode** (`auth.h/.cpp`): the full agent-key verdict — name
+  scan, digest comparison (via a SHA-256 syscall), and the decision — runs as
+  BVM bytecode. The host side only serializes the registry into the VM data
+  buffer. Every fault (bad opcode, out-of-bounds access, truncated code,
+  exhausted step budget, debugger attached on Windows) fails closed: not
+  authenticated, never the opposite.
+- **Self-integrity** (`integrity.h/.cpp`): `babele selfhash` prints the
+  SHA-256 of the running executable; compare it against the release digest to
+  confirm the binary is untampered.
+
+Honest limits: source is public, so this raises the cost of binary tampering —
+it does not hide the logic; and no local scheme beats code signing plus a
+trust chain. Cloud tiers (Fondamenta/Tetto) enforce their gates server-side
+where the client cannot reach.
+
 ## Portability
 
 C++17, standard library only, no third-party deps. One thread per connection;

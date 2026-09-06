@@ -8,6 +8,9 @@
 #include <vector>
 
 #include "jsjson.h"
+#include "protect/auth.h"
+#include "protect/integrity.h"
+#include "protect/vm.h"
 #include "sha256.h"
 #include "store.h"
 #include "util.h"
@@ -919,6 +922,122 @@ static void testReportModes() {
     CHECK(has(r, "如蒙圣鉴，谨此奏闻。"));
 }
 
+// ---- protection layer (BVM) ---------------------------------------------------
+
+using gr::BVM_ADDI;
+using gr::BVM_ADD;
+using gr::BVM_HALT;
+using gr::BVM_JMP;
+using gr::BVM_LD8;
+using gr::BVM_LOADI;
+using gr::BVM_SHL;
+using gr::BVM_ST8;
+using gr::BVM_SYS;
+using gr::BVM_SYS_SHA256HEX;
+
+static std::vector<uint8_t> bvmIns(uint8_t op, uint8_t dst, uint8_t s1, uint8_t s2,
+                                   uint32_t imm) {
+    std::vector<uint8_t> v;
+    v.push_back(op);
+    v.push_back(dst);
+    v.push_back(s1);
+    v.push_back(s2);
+    for (int i = 0; i < 4; ++i) v.push_back(static_cast<uint8_t>(imm >> (8 * i)));
+    return v;
+}
+
+static std::vector<uint8_t> concat(std::vector<std::vector<uint8_t>> parts) {
+    std::vector<uint8_t> out;
+    for (const auto& p : parts) out.insert(out.end(), p.begin(), p.end());
+    return out;
+}
+
+static void testBvmArithmetic() {
+    // r1 = 21; r2 = 1; r3 = r1 << r2 = 42; exit r3
+    std::vector<uint8_t> code = concat({
+        bvmIns(BVM_LOADI, 1, 0, 0, 21),
+        bvmIns(BVM_LOADI, 2, 0, 0, 1),
+        bvmIns(BVM_SHL, 3, 1, 2, 0),
+        bvmIns(BVM_HALT, 3, 0, 0, 0),
+    });
+    std::vector<uint8_t> data(16);
+    CHECK(gr::bvmRun(code.data(), code.size(), data.data(), data.size(), 1000) == 42);
+
+    // ST8 then LD8 roundtrip, plus ADDI.
+    code = concat({
+        bvmIns(BVM_LOADI, 1, 0, 0, 7),
+        bvmIns(BVM_LOADI, 4, 0, 0, 4),         // r4 = 4 (address)
+        bvmIns(BVM_ST8, 4, 1, 0, 0),           // data[r4] = 7
+        bvmIns(BVM_LOADI, 5, 0, 0, 4),
+        bvmIns(BVM_LD8, 6, 5, 0, 0),           // r6 = data[4]
+        bvmIns(BVM_ADDI, 7, 6, 0, 100),         // r7 = 107
+        bvmIns(BVM_HALT, 7, 0, 0, 0),
+    });
+    CHECK(gr::bvmRun(code.data(), code.size(), data.data(), data.size(), 1000) == 107);
+
+    // Unknown opcode -> fail closed.
+    code = concat({bvmIns(0xEE, 0, 0, 0, 0)});
+    CHECK(gr::bvmRun(code.data(), code.size(), data.data(), data.size(), 1000) == -1);
+
+    // Infinite loop -> step budget exhausted -> fail closed.
+    code = concat({bvmIns(BVM_JMP, 0, 0, 0, 0)});
+    CHECK(gr::bvmRun(code.data(), code.size(), data.data(), data.size(), 100) == -1);
+
+    // Out-of-bounds LD8 -> fail closed.
+    code = concat({bvmIns(BVM_LOADI, 1, 0, 0, 999),
+                   bvmIns(BVM_LD8, 2, 1, 0, 0),
+                   bvmIns(BVM_HALT, 2, 0, 0, 0)});
+    CHECK(gr::bvmRun(code.data(), code.size(), data.data(), data.size(), 1000) == -1);
+
+    // Truncated code -> fail closed.
+    code = concat({bvmIns(BVM_LOADI, 1, 0, 0, 1)});
+    code.pop_back();
+    CHECK(gr::bvmRun(code.data(), code.size(), data.data(), data.size(), 1000) == -1);
+}
+
+static void testBvmSha256Syscall() {
+    // SYS_SHA256HEX of data[16..18] ("abc") must land at data[28..91].
+    std::vector<uint8_t> code = concat({
+        bvmIns(BVM_LOADI, 1, 0, 0, 16),
+        bvmIns(BVM_LOADI, 2, 0, 0, 3),
+        bvmIns(BVM_SYS, 3, 1, 2, BVM_SYS_SHA256HEX),
+        bvmIns(BVM_HALT, 3, 0, 0, 0),
+    });
+    std::vector<uint8_t> data(128, 0);
+    std::memcpy(data.data() + 16, "abc", 3);
+    CHECK(gr::bvmRun(code.data(), code.size(), data.data(), data.size(), 1000) == 0);
+    CHECK(std::memcmp(data.data() + 28, gr::sha256Hex("abc").data(), 64) == 0);
+}
+
+static void testBvmAuth() {
+    std::vector<std::pair<std::string, std::string>> reg = {
+        {"alice", gr::sha256Hex("correct horse battery")},
+        {"bob", gr::sha256Hex("staple pony nine")},
+    };
+    CHECK(gr::bvmAgentCheck(reg, "alice", "correct horse battery"));
+    CHECK(gr::bvmAgentCheck(reg, "bob", "staple pony nine"));
+    CHECK(!gr::bvmAgentCheck(reg, "alice", "wrong key"));
+    CHECK(!gr::bvmAgentCheck(reg, "unknown", "correct horse battery"));
+    CHECK(!gr::bvmAgentCheck(reg, "alice", ""));
+    CHECK(!gr::bvmAgentCheck(reg, "", "key"));
+    // malformed registry hash -> fail closed
+    std::vector<std::pair<std::string, std::string>> bad = {{"alice", "short"}};
+    CHECK(!gr::bvmAgentCheck(bad, "alice", "correct horse battery"));
+    // empty registry never authenticates
+    CHECK(!gr::bvmAgentCheck({}, "alice", "correct horse battery"));
+    // long names still match byte-for-byte through the VM
+    std::string longName(64, 'x');
+    reg.push_back({longName, gr::sha256Hex("long agent key")});
+    CHECK(gr::bvmAgentCheck(reg, longName, "long agent key"));
+}
+
+static void testSelfHash() {
+    std::string h = gr::selfSha256();
+    CHECK(h.size() == 64);
+    bool hex = h.find_first_not_of("0123456789abcdef") == std::string::npos;
+    CHECK(hex);
+}
+
 int main() {
     testSha256();
     testJsonRoundTrip();
@@ -941,6 +1060,10 @@ int main() {
     testCustomPosts();
     testPopulation();
     testReportModes();
+    testBvmArithmetic();
+    testBvmSha256Syscall();
+    testBvmAuth();
+    testSelfHash();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
 }

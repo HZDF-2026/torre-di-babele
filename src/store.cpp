@@ -12,6 +12,7 @@
 #include <sys/types.h>
 
 #include "jsjson.h"
+#include "protect/auth.h"
 #include "sha256.h"
 #include "util.h"
 
@@ -655,9 +656,12 @@ bool RoomStore::agentCheck(const std::string& name, const std::string& key) {
     if (name.empty() || key.empty()) return false;
     std::lock_guard<std::mutex> lock(mu_);
     loadAgents();
-    for (const AgentEntry& a : agents_)
-        if (a.name == name) return a.keyHash == sha256Hex(key);
-    return false;
+    // The verdict runs as BVM bytecode (protect/auth.cpp), not native code:
+    // no single-byte patch site, and any fault fails closed.
+    std::vector<std::pair<std::string, std::string>> reg;
+    reg.reserve(agents_.size());
+    for (const AgentEntry& a : agents_) reg.emplace_back(a.name, a.keyHash);
+    return bvmAgentCheck(reg, name, key);
 }
 
 // ---- population -------------------------------------------------------------
