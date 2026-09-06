@@ -3,4 +3,4 @@
 set -e
 cd "$(dirname "$0")"
 make all
-echo "built dist/greenroom"
+echo "built dist/babele"

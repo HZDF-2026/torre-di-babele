@@ -29,7 +29,7 @@
 //   GET  /v1/search?q&room&limit
 //   GET  /                                (web UI shell, no auth)
 //
-// Identity: X-GR-Agent + X-GR-Key headers (key verified against the
+// Identity: X-Babele-Agent + X-Babele-Key headers (key verified against the
 // server-global registry; only its SHA-256 is stored). In a chamber every
 // route requires a verified identity, the acting agent must equal it, and
 // non-members see 404.
@@ -214,7 +214,7 @@ bool splitRoomPath(const std::string& path, std::string& room, std::string& rest
     return !room.empty();
 }
 
-// Agent identity carried by X-GR-Agent/X-GR-Key headers. present: headers
+// Agent identity carried by X-Babele-Agent/X-Babele-Key headers. present: headers
 // were sent at all; ok: name registered and key matched; name: claimed name.
 struct Identity {
     bool present = false;
@@ -224,8 +224,8 @@ struct Identity {
 
 Identity parseIdentity(const HttpRequest& req, RoomStore& store) {
     Identity id;
-    auto a = req.headers.find("x-gr-agent");
-    auto k = req.headers.find("x-gr-key");
+    auto a = req.headers.find("x-babele-agent");
+    auto k = req.headers.find("x-babele-key");
     if (a == req.headers.end() || k == req.headers.end()) return id;
     id.present = true;
     id.name = a->second;
@@ -252,7 +252,7 @@ HttpHandler makeApiRouter(RoomStore& store, const std::string& token) {
 
         if (p == "/v1/status" && req.method == "GET") {
             Json j = Json::object();
-            j.set("name", Json::string("greenroom"));
+            j.set("name", Json::string("babele"));
             j.set("version", Json::string(VERSION));
             j.set("rooms", Json::number(static_cast<double>(store.rooms().size())));
             return json(200, j);
@@ -306,7 +306,7 @@ HttpHandler makeApiRouter(RoomStore& store, const std::string& token) {
                 if (chamber) {
                     if (!id.present || !id.ok)
                         return err(403, "creating a chamber requires verified identity "
-                                        "headers (X-GR-Agent/X-GR-Key)");
+                                        "headers (X-Babele-Agent/X-Babele-Key)");
                     if (!store.createRoom(name, true, id.name))
                         return err(409, "room exists");
                 } else {
@@ -331,7 +331,7 @@ HttpHandler makeApiRouter(RoomStore& store, const std::string& token) {
                 // (existence hidden).
                 if (!id.present || !id.ok)
                     return err(403, "chamber rooms require verified identity "
-                                    "(X-GR-Agent/X-GR-Key)");
+                                    "(X-Babele-Agent/X-Babele-Key)");
                 if (!store.canView(room, id.name))
                     return err(404, "unknown room: " + room);
                 // Action binding: every mutating request's body agent must

@@ -11,7 +11,7 @@ const char* kWebUiHtml = R"HTML(<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>greenroom</title>
+<title>babele</title>
 <style>
 :root{
   --bg:#0e1116;--panel:#161b23;--panel2:#1c2330;--line:#232b3a;
@@ -88,7 +88,7 @@ h3.sec{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:1
 </head>
 <body>
 <header>
-  <span class="logo">greenroom</span><span class="ver" id="ver"></span>
+  <span class="logo">babele</span><span class="ver" id="ver"></span>
   <span style="flex:1"></span>
   <input id="me" placeholder="your name" style="width:110px" title="Agent name used for task actions">
   <input id="token" placeholder="token" type="password" style="width:110px" title="Bearer token, only when serve runs with --token">
@@ -143,7 +143,7 @@ async function connect(){
     $("#rooms").innerHTML = rooms.length ? rooms.map(r =>
       `<div class="room-item${r===cur?' sel':''}" onclick="selectRoom('${esc(r)}')">${esc(r)}</div>`).join("")
       : `<div class="empty">no rooms</div>`;
-  }catch(e){ if(String(e.message)!=="401") banner("cannot reach greenroom serve — is it running?"); }
+  }catch(e){ if(String(e.message)!=="401") banner("cannot reach babele serve — is it running?"); }
 }
 function promptRoom(){
   const name = prompt("room name (a-z 0-9 . _ -):");

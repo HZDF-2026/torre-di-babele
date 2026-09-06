@@ -315,7 +315,7 @@ ClientResult httpClient(const std::string& host, int port, const std::string& me
     addr.sin_port = htons(static_cast<unsigned short>(port));
     addr.sin_addr.s_addr = inet_addr(host.c_str());
     if (::connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0) {
-        r.err = "connect failed — is `greenroom serve` running? (see GREENROOM_URL)";
+        r.err = "connect failed — is `babele serve` running? (see BABELE_URL)";
         closeSock(s);
         return r;
     }

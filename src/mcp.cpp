@@ -1,16 +1,16 @@
 // mcp.cpp — see mcp.h. Newline-delimited JSON-RPC 2.0 on stdio.
 //
 // Tool set (proxied to serve via HTTP):
-//   greenroom_protocol                          the sub-agent briefing text
-//   greenroom_status / rooms / create_room
-//   greenroom_agents                            the registered-agent roster
-//   greenroom_say / listen
-//   greenroom_claim / release / claims
-//   greenroom_board_get / board_set
-//   greenroom_verify
-//   greenroom_task                              evidence-gated task board
-//   greenroom_report                            hzdf|company|feudal room report
-//   greenroom_society                           goal/gens/roles/posts/members/
+//   babele_protocol                          the sub-agent briefing text
+//   babele_status / rooms / create_room
+//   babele_agents                            the registered-agent roster
+//   babele_say / listen
+//   babele_claim / release / claims
+//   babele_board_get / board_set
+//   babele_verify
+//   babele_task                              evidence-gated task board
+//   babele_report                            hzdf|company|feudal room report
+//   babele_society                           goal/gens/roles/posts/members/
 //                                               population (post-define etc.)
 #include "mcp.h"
 
@@ -29,25 +29,25 @@ namespace gr {
 namespace {
 
 const char* kProtocolBriefing =
-    "You are agent {name} working in greenroom room {room} — a shared workspace "
+    "You are agent {name} working in babele room {room} — a shared workspace "
     "for parallel agents. Protocol, in order:\n"
-    "1. Sync first: run `greenroom listen {room} --since 0`. Everything other "
+    "1. Sync first: run `babele listen {room} --since 0`. Everything other "
     "agents found is already there — do not re-read files they reported as facts; "
     "trust and build on them.\n"
-    "2. Claim before touching: `greenroom claim {room} <path-or-task> --agent {name}` "
+    "2. Claim before touching: `babele claim {room} <path-or-task> --agent {name}` "
     "for every file or task you will modify. HTTP 409 means someone owns it: do not "
     "fight, pick other work or ask in the room.\n"
     "3. Publish as you go: every non-trivial finding becomes "
-    "`greenroom say {room} fact \"<path>:<line> — <finding>\" --agent {name}`. "
+    "`babele say {room} fact \"<path>:<line> — <finding>\" --agent {name}`. "
     "Facts are the room's currency; yours save the next agent a read.\n"
-    "4. Ask, don't stall: `greenroom say {room} ask \"<question>\" --agent {name}`; "
+    "4. Ask, don't stall: `babele say {room} ask \"<question>\" --agent {name}`; "
     "answer others with `answer` and `--ref <id>`.\n"
-    "5. Leave clean: `greenroom release {room} --scope <s> --agent {name}`, then "
-    "`greenroom say {room} done \"<one-line summary>\" --agent {name}`.\n"
-    "6. Task board: `greenroom task list {room}` — claim a task, submit it with "
+    "5. Leave clean: `babele release {room} --scope <s> --agent {name}`, then "
+    "`babele say {room} done \"<one-line summary>\" --agent {name}`.\n"
+    "6. Task board: `babele task list {room}` — claim a task, submit it with "
     "evidence (`task submit {room} <id> \"<evidence>\"`); a different agent "
-    "verifies. Search old findings: `greenroom search <text>`.\n"
-    "7. Society: check `greenroom_society status` for {room}. If the room has a "
+    "verifies. Search old findings: `babele search <text>`.\n"
+    "7. Society: check `babele_society status` for {room}. If the room has a "
     "god goal, you are one mortal generation of a society that exists only to "
     "fulfill it. When your generation's task board drains with the goal still "
     "open, the server retires your generation and births the next one — the "
@@ -59,7 +59,7 @@ const char* kProtocolBriefing =
     "laws (invariants that held across phases), then open questions (what "
     "the next generation must resolve). Take a post (commander, recorder, "
     "executor, reviewer, tester — or a custom post defined via "
-    "`greenroom_society post-define`); while roles are registered, only posts "
+    "`babele_society post-define`); while roles are registered, only posts "
     "carrying the verify bits may verify tasks and goal achievement. A goal "
     "may declare an oracle: an http:// URL answering {\"satisfied\": bool} — "
     "the sole judge of achievement; credentials live inside the oracle "
@@ -67,16 +67,16 @@ const char* kProtocolBriefing =
     "block generation turnover until the sovereign agent 'human' signs them. "
     "Propose achievement only with evidence (`goal achieve`); a different "
     "agent verifies it.\n"
-    "8. Parent loop: the parent agent long-polls `greenroom wait {room}`; on a "
+    "8. Parent loop: the parent agent long-polls `babele wait {room}`; on a "
     "`gen` message it spawns the next generation's sub-agents with this "
     "briefing, on `goal` ACHIEVED it stops. Population protocol: poll "
-    "`greenroom_society population` — the target is 5-10 observably-active "
+    "`babele_society population` — the target is 5-10 observably-active "
     "agents per room; when activity drops below 3, replenish in batches of at "
     "most 4 concurrent spawns. The signal is observational (active claims, "
     "speech within 30 min, in-flight tasks) — a missing agent may just be "
     "busy; verify before assuming death.\n"
     "9. Reporting: when the parent or the human wants a digest, render the "
-    "room with `greenroom_report` (modes: hzdf — the default, the HZDF-2026 "
+    "room with `babele_report` (modes: hzdf — the default, the HZDF-2026 "
     "distillation shape of phase history|laws|open questions; company — a "
     "corporate briefing of TL;DR/KPIs/by-post/risks/next steps; feudal — a "
     "court memorial of 国祚/军情/贡赋/民生/请旨). Reports are deterministic "
@@ -91,7 +91,7 @@ struct Target {
 
 Target parseTarget() {
     Target t;
-    std::string url = envOr("GREENROOM_URL", "http://127.0.0.1:7788");
+    std::string url = envOr("BABELE_URL", "http://127.0.0.1:7788");
     const std::string prefix = "http://";
     std::string rest = url.compare(0, prefix.size(), prefix) == 0 ? url.substr(prefix.size()) : url;
     size_t colon = rest.rfind(':');
@@ -194,33 +194,33 @@ Json toolsList() {
     Json tools = Json::array();
     {
         Json p = Json::object();
-        tools.push(toolDef("greenroom_protocol",
-                           "Returns the greenroom sub-agent briefing. Call it and paste the "
+        tools.push(toolDef("babele_protocol",
+                           "Returns the babele sub-agent briefing. Call it and paste the "
                            "text into every sub-agent prompt you spawn; replace {name} and "
                            "{room}.",
                            p, {}));
     }
     {
         Json p = Json::object();
-        tools.push(toolDef("greenroom_status", "Server status: version, room count.", p, {}));
+        tools.push(toolDef("babele_status", "Server status: version, room count.", p, {}));
     }
     {
         Json p = Json::object();
-        tools.push(toolDef("greenroom_rooms", "List all rooms.", p, {}));
+        tools.push(toolDef("babele_rooms", "List all rooms.", p, {}));
     }
     {
         Json p = Json::object();
-        tools.push(toolDef("greenroom_agents",
+        tools.push(toolDef("babele_agents",
                            "List registered agent identities (the roster chambers "
                            "authenticate against). Registration itself is a CLI "
-                           "operation: `greenroom agent register NAME --key KEY` — keys "
+                           "operation: `babele agent register NAME --key KEY` — keys "
                            "never travel through tool calls.",
                            p, {}));
     }
     {
         Json p = Json::object();
         p.set("room", propStr("Room name, [a-zA-Z0-9._-]"));
-        tools.push(toolDef("greenroom_create_room", "Create a room for one task.", p, {"room"}));
+        tools.push(toolDef("babele_create_room", "Create a room for one task.", p, {"room"}));
     }
     {
         Json p = Json::object();
@@ -229,7 +229,7 @@ Json toolsList() {
         p.set("type", propStr("say|plan|fact|ask|answer|done"));
         p.set("content", propStr("Message text"));
         p.set("ref", propNum("Referenced message id (answers), optional"));
-        tools.push(toolDef("greenroom_say", "Post a message to a room.", p,
+        tools.push(toolDef("babele_say", "Post a message to a room.", p,
                            {"room", "agent", "type", "content"}));
     }
     {
@@ -237,14 +237,14 @@ Json toolsList() {
         p.set("room", propStr("Room name"));
         p.set("since", propNum("Only messages with id > since; 0 = all"));
         p.set("limit", propNum("Max messages to return"));
-        tools.push(toolDef("greenroom_listen", "Read messages from a room.", p, {"room"}));
+        tools.push(toolDef("babele_listen", "Read messages from a room.", p, {"room"}));
     }
     {
         Json p = Json::object();
         p.set("room", propStr("Room name"));
         p.set("since", propNum("Wait for messages with id > since; 0 = any message"));
         p.set("timeout_ms", propNum("Max wait, default 30000; server caps at 60000"));
-        tools.push(toolDef("greenroom_wait",
+        tools.push(toolDef("babele_wait",
                            "Long-poll: block until a new message arrives, then return it. "
                            "Cheaper than repeated listen calls.",
                            p, {"room"}));
@@ -254,7 +254,7 @@ Json toolsList() {
         p.set("query", propStr("Case-insensitive substring to find in content/agent/type"));
         p.set("room", propStr("Restrict to one room, optional"));
         p.set("limit", propNum("Max hits, default 50"));
-        tools.push(toolDef("greenroom_search", "Search messages across all rooms.", p,
+        tools.push(toolDef("babele_search", "Search messages across all rooms.", p,
                            {"query"}));
     }
     {
@@ -263,7 +263,7 @@ Json toolsList() {
         p.set("agent", propStr("Claiming agent name"));
         p.set("scope", propStrArr("Files or task labels to own"));
         p.set("ttl_s", propNum("Lease seconds, default 600"));
-        tools.push(toolDef("greenroom_claim",
+        tools.push(toolDef("babele_claim",
                            "Claim ownership of files/tasks. 409 = someone else owns it.",
                            p, {"room", "agent", "scope"}));
     }
@@ -273,18 +273,18 @@ Json toolsList() {
         p.set("agent", propStr("Releasing agent name"));
         p.set("claim_id", propNum("Claim id, optional"));
         p.set("scope", propStr("Scope entry, optional"));
-        tools.push(toolDef("greenroom_release", "Release a claim.", p, {"room", "agent"}));
+        tools.push(toolDef("babele_release", "Release a claim.", p, {"room", "agent"}));
     }
     {
         Json p = Json::object();
         p.set("room", propStr("Room name"));
-        tools.push(toolDef("greenroom_claims", "List active claims in a room.", p, {"room"}));
+        tools.push(toolDef("babele_claims", "List active claims in a room.", p, {"room"}));
     }
     {
         Json p = Json::object();
         p.set("room", propStr("Room name"));
         p.set("key", propStr("Board key, e.g. decision/db-choice"));
-        tools.push(toolDef("greenroom_board_get", "Read one blackboard entry.", p,
+        tools.push(toolDef("babele_board_get", "Read one blackboard entry.", p,
                            {"room", "key"}));
     }
     {
@@ -293,13 +293,13 @@ Json toolsList() {
         p.set("key", propStr("Board key"));
         p.set("value", propStr("Value text (free-form, may be JSON)"));
         p.set("agent", propStr("Writing agent name"));
-        tools.push(toolDef("greenroom_board_set", "Write one blackboard entry.", p,
+        tools.push(toolDef("babele_board_set", "Write one blackboard entry.", p,
                            {"room", "key", "value", "agent"}));
     }
     {
         Json p = Json::object();
         p.set("room", propStr("Room name"));
-        tools.push(toolDef("greenroom_verify", "Verify the room's SHA-256 message chain.", p,
+        tools.push(toolDef("babele_verify", "Verify the room's SHA-256 message chain.", p,
                            {"room"}));
     }
     {
@@ -321,7 +321,7 @@ Json toolsList() {
                              "may verify it and generation turnover blocks until signed"));
         p2.set("human", std::move(hum));
         p2.set("agent", propStr("Acting agent name"));
-        tools.push(toolDef("greenroom_task",
+        tools.push(toolDef("babele_task",
                            "Evidence-gated task board: create, claim, submit (with "
                            "evidence), verify (must be a different agent than the "
                            "submitter), list.",
@@ -364,7 +364,7 @@ Json toolsList() {
         acc.set("type", Json::string("boolean"));
         acc.set("description", Json::string("goal-verify: true=accept, false=reject"));
         p3.set("accept", std::move(acc));
-        tools.push(toolDef("greenroom_society",
+        tools.push(toolDef("babele_society",
                            "The society layer: a god goal the room exists to fulfill, "
                            "generations of agents (a new one is born automatically "
                            "whenever a generation drains with the goal still open), "
@@ -385,7 +385,7 @@ Json toolsList() {
                                "history|laws|open questions) | company (corporate "
                                "briefing: TL;DR/KPIs/by post/risks/next steps) | "
                                "feudal (court memorial: 国祚/军情/贡赋/民生/请旨)"));
-        tools.push(toolDef("greenroom_report",
+        tools.push(toolDef("babele_report",
                            "Render the room as a structured report for the parent "
                            "agent or the human. Three modes: hzdf (Dengyun default), "
                            "company and feudal (Lanshan additions). Deterministic "
@@ -399,37 +399,37 @@ Json toolsList() {
 
 // ---- HTTP proxy helpers ------------------------------------------------
 
-// Identity headers from the environment (GREENROOM_AGENT + GREENROOM_KEY).
+// Identity headers from the environment (BABELE_AGENT + BABELE_KEY).
 // Sub-agents that work in chambers are provisioned with both; open rooms
 // ignore them.
 std::map<std::string, std::string> identityHeaders() {
     std::map<std::string, std::string> h;
-    std::string agent = envOr("GREENROOM_AGENT", "");
-    std::string key = envOr("GREENROOM_KEY", "");
+    std::string agent = envOr("BABELE_AGENT", "");
+    std::string key = envOr("BABELE_KEY", "");
     if (!agent.empty() && !key.empty()) {
-        h["X-GR-Agent"] = agent;
-        h["X-GR-Key"] = key;
+        h["X-Babele-Agent"] = agent;
+        h["X-Babele-Key"] = key;
     }
     return h;
 }
 
 std::string get(const Target& t, const std::string& target) {
     ClientResult r = httpClient(t.host, t.port, "GET", target, "",
-                                envOr("GREENROOM_TOKEN", ""), 0, identityHeaders());
+                                envOr("BABELE_TOKEN", ""), 0, identityHeaders());
     if (!r.ok && r.status == 0) return "{\"error\":\"transport: " + r.err + "\"}";
     return r.body;
 }
 
 std::string post(const Target& t, const std::string& target, const Json& body) {
     ClientResult r = httpClient(t.host, t.port, "POST", target, body.dump(),
-                                envOr("GREENROOM_TOKEN", ""), 0, identityHeaders());
+                                envOr("BABELE_TOKEN", ""), 0, identityHeaders());
     if (!r.ok && r.status == 0) return "{\"error\":\"transport: " + r.err + "\"}";
     return r.body;
 }
 
 std::string put(const Target& t, const std::string& target, const Json& body) {
     ClientResult r = httpClient(t.host, t.port, "PUT", target, body.dump(),
-                                envOr("GREENROOM_TOKEN", ""), 0, identityHeaders());
+                                envOr("BABELE_TOKEN", ""), 0, identityHeaders());
     if (!r.ok && r.status == 0) return "{\"error\":\"transport: " + r.err + "\"}";
     return r.body;
 }
@@ -463,17 +463,17 @@ std::string urlEnc(const std::string& s) {
 std::string callTool(const std::string& name, const Json& args) {
     Target t = parseTarget();
 
-    if (name == "greenroom_protocol") return kProtocolBriefing;
-    if (name == "greenroom_status") return get(t, "/v1/status");
-    if (name == "greenroom_rooms") return get(t, "/v1/rooms");
-    if (name == "greenroom_agents") return get(t, "/v1/agents");
+    if (name == "babele_protocol") return kProtocolBriefing;
+    if (name == "babele_status") return get(t, "/v1/status");
+    if (name == "babele_rooms") return get(t, "/v1/rooms");
+    if (name == "babele_agents") return get(t, "/v1/agents");
 
-    if (name == "greenroom_create_room") {
+    if (name == "babele_create_room") {
         Json body = Json::object();
         body.set("name", Json::string(argStr(args, "room")));
         return post(t, "/v1/rooms", body);
     }
-    if (name == "greenroom_search") {
+    if (name == "babele_search") {
         std::string q = argStr(args, "query");
         if (q.empty()) return "{\"error\":\"query required\"}";
         std::string target = "/v1/search?q=" + urlEnc(q);
@@ -487,7 +487,7 @@ std::string callTool(const std::string& name, const Json& args) {
     if (room.empty()) return "{\"error\":\"room required\"}";
     std::string base = "/v1/rooms/" + urlEnc(room);
 
-    if (name == "greenroom_say") {
+    if (name == "babele_say") {
         Json body = Json::object();
         body.set("agent", Json::string(argStr(args, "agent")));
         body.set("type", Json::string(argStr(args, "type", "say")));
@@ -496,24 +496,24 @@ std::string callTool(const std::string& name, const Json& args) {
         if (ref >= 0) body.set("ref", Json::number(static_cast<double>(ref)));
         return post(t, base + "/say", body);
     }
-    if (name == "greenroom_listen") {
+    if (name == "babele_listen") {
         std::string q = "?since=" + std::to_string(argNum(args, "since", 0));
         if (argNum(args, "limit", 0) > 0)
             q += "&limit=" + std::to_string(argNum(args, "limit", 0));
         return get(t, base + "/messages" + q);
     }
-    if (name == "greenroom_wait") {
+    if (name == "babele_wait") {
         std::string q = "?since=" + std::to_string(argNum(args, "since", 0));
         long long to = argNum(args, "timeout_ms", 0);
         if (to > 0) q += "&timeout_ms=" + std::to_string(to);
         return get(t, base + "/wait" + q);
     }
-    if (name == "greenroom_report") {
+    if (name == "babele_report") {
         std::string mode = argStr(args, "mode", "hzdf");
         if (mode.empty()) mode = "hzdf";
         return get(t, base + "/report?mode=" + urlEnc(mode));
     }
-    if (name == "greenroom_task") {
+    if (name == "babele_task") {
         std::string action = argStr(args, "action");
         std::string agent = argStr(args, "agent");
         long long id = argNum(args, "id", 0);
@@ -550,7 +550,7 @@ std::string callTool(const std::string& name, const Json& args) {
         }
         return "{\"error\":\"unknown action: " + action + "\"}";
     }
-    if (name == "greenroom_society") {
+    if (name == "babele_society") {
         std::string action = argStr(args, "action");
         std::string agent = argStr(args, "agent");
         if (action == "status") return get(t, base + "/society");
@@ -623,7 +623,7 @@ std::string callTool(const std::string& name, const Json& args) {
         if (action == "population") return get(t, base + "/population");
         return "{\"error\":\"unknown action: " + action + "\"}";
     }
-    if (name == "greenroom_claim") {
+    if (name == "babele_claim") {
         Json body = Json::object();
         body.set("agent", Json::string(argStr(args, "agent")));
         Json sc = Json::array();
@@ -637,7 +637,7 @@ std::string callTool(const std::string& name, const Json& args) {
         if (ttl > 0) body.set("ttl_s", Json::number(static_cast<double>(ttl)));
         return post(t, base + "/claim", body);
     }
-    if (name == "greenroom_release") {
+    if (name == "babele_release") {
         Json body = Json::object();
         body.set("agent", Json::string(argStr(args, "agent")));
         long long cid = argNum(args, "claim_id", 0);
@@ -646,16 +646,16 @@ std::string callTool(const std::string& name, const Json& args) {
         if (!scope.empty()) body.set("scope", Json::string(scope));
         return post(t, base + "/release", body);
     }
-    if (name == "greenroom_claims") return get(t, base + "/claims");
-    if (name == "greenroom_board_get")
+    if (name == "babele_claims") return get(t, base + "/claims");
+    if (name == "babele_board_get")
         return get(t, base + "/board/" + urlEnc(argStr(args, "key")));
-    if (name == "greenroom_board_set") {
+    if (name == "babele_board_set") {
         Json body = Json::object();
         body.set("agent", Json::string(argStr(args, "agent")));
         body.set("value", Json::string(argStr(args, "value")));
         return put(t, base + "/board/" + urlEnc(argStr(args, "key")), body);
     }
-    if (name == "greenroom_verify") return get(t, base + "/verify");
+    if (name == "babele_verify") return get(t, base + "/verify");
     return "{\"error\":\"unknown tool: " + name + "\"}";
 }
 
@@ -663,7 +663,7 @@ std::string callTool(const std::string& name, const Json& args) {
 // MCP tools work without manual setup. Remote targets are never started.
 void ensureServeRunning() {
     Target t = parseTarget();
-    std::string token = envOr("GREENROOM_TOKEN", "");
+    std::string token = envOr("BABELE_TOKEN", "");
     ClientResult r = httpClient(t.host, t.port, "GET", "/v1/status", "", token);
     if (r.status != 0) return;  // any HTTP answer (even 401) means it is up
     if (t.host != "127.0.0.1" && t.host != "localhost") return;
@@ -706,7 +706,7 @@ int runMcp() {
             caps.set("tools", std::move(toolsCap));
             r.set("capabilities", std::move(caps));
             Json info = Json::object();
-            info.set("name", Json::string("greenroom"));
+            info.set("name", Json::string("babele"));
             info.set("version", Json::string(VERSION));
             r.set("serverInfo", std::move(info));
             std::cout << rpcResult(id, std::move(r)).dump() << "\n" << std::flush;

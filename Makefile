@@ -1,5 +1,5 @@
-# greenroom — C++17, no third-party deps. Win (MinGW-w64) + POSIX.
-# make / make all   build dist/greenroom(.exe)
+# babele — C++17, no third-party deps. Win (MinGW-w64) + POSIX.
+# make / make all   build dist/babele(.exe)
 # make test         build and run the unit tests
 # make clean        remove build artifacts
 #
@@ -23,7 +23,7 @@ LIB_SRCS := src/util.cpp src/sha256.cpp src/jsjson.cpp src/store.cpp src/http.cp
 OBJS := $(addprefix $(BUILD)/,$(notdir $(SRCS:.cpp=.o)))
 LIB_OBJS := $(addprefix $(BUILD)/,$(notdir $(LIB_SRCS:.cpp=.o)))
 
-BIN := $(DIST)/greenroom$(if $(filter $(OS),Windows_NT),.exe,)
+BIN := $(DIST)/babele$(if $(filter $(OS),Windows_NT),.exe,)
 TEST_BIN := $(BUILD)/test_unit$(if $(filter $(OS),Windows_NT),.exe,)
 
 ifeq ($(OS),Windows_NT)

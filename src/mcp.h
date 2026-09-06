@@ -1,4 +1,4 @@
-// mcp.h — greenroom as an MCP stdio server (JSON-RPC 2.0, line-delimited).
+// mcp.h — babele as an MCP stdio server (JSON-RPC 2.0, line-delimited).
 #ifndef GR_MCP_H
 #define GR_MCP_H
 
@@ -7,7 +7,7 @@
 namespace gr {
 
 // Blocks: reads JSON-RPC lines from stdin, writes responses to stdout.
-// Proxies to the greenroom serve process at GREENROOM_URL.
+// Proxies to the babele serve process at BABELE_URL.
 int runMcp();
 
 }  // namespace gr

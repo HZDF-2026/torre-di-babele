@@ -18,54 +18,54 @@ namespace gr {
 namespace {
 
 void usage() {
-    std::cerr << "greenroom " << VERSION << " — shared chat room for coding sub-agents\n"
+    std::cerr << "babele " << VERSION << " — shared chat room for coding sub-agents\n"
               << "\n"
               << "usage:\n"
-              << "  greenroom serve  [--port 7788] [--data DIR] [--bind 127.0.0.1] [--token S]\n"
-              << "  greenroom status\n"
-              << "  greenroom agent  register NAME --key KEY\n"
-              << "  greenroom agent  list\n"
-              << "  greenroom rooms\n"
-              << "  greenroom create ROOM [--chamber]      (chamber needs --agent + --key)\n"
-              << "  greenroom member list ROOM\n"
-              << "  greenroom member add ROOM AGENT        (caller: --agent + --key, member only)\n"
-              << "  greenroom say    ROOM TYPE CONTENT [--agent A] [--ref N]\n"
-              << "  greenroom listen ROOM [--since N] [--limit M] [--follow] [--agent A]\n"
-              << "  greenroom wait   ROOM [--since N] [--timeout-ms 30000]\n"
-              << "  greenroom search QUERY [--room R] [--limit N]\n"
-              << "  greenroom claim  ROOM SCOPE... [--ttl 600] [--agent A]\n"
-              << "  greenroom release ROOM (--id N | --scope S) [--agent A]\n"
-              << "  greenroom claims ROOM\n"
-              << "  greenroom board  get ROOM KEY\n"
-              << "  greenroom board  set ROOM KEY VALUE [--agent A]\n"
-              << "  greenroom task add ROOM TITLE... [--detail D] [--agent A] [--human]\n"
-              << "  greenroom task list ROOM\n"
-              << "  greenroom task claim ROOM ID [--agent A]\n"
-              << "  greenroom task submit ROOM ID EVIDENCE... [--agent A]\n"
-              << "  greenroom task verify ROOM ID [--agent A] [--reject]\n"
-              << "  greenroom post   define ROOM NAME [--verify-task] [--verify-goal] [--model M]\n"
-              << "  greenroom post   list ROOM\n"
-              << "  greenroom population ROOM\n"
-              << "  greenroom report  ROOM [--mode hzdf|company|feudal]\n"
-              << "  greenroom goal  set ROOM TEXT... [--criteria C] [--oracle URL] [--agent A]\n"
-              << "  greenroom goal  show ROOM\n"
-              << "  greenroom goal  achieve ROOM EVIDENCE... [--agent A]\n"
-              << "  greenroom goal  verify ROOM [--agent A] [--reject]\n"
-              << "  greenroom goal  abandon ROOM REASON... [--agent A]\n"
-              << "  greenroom gen   ROOM\n"
-              << "  greenroom gen   advance ROOM NOTE... [--agent A]\n"
-              << "  greenroom gen   chronicle ROOM TEXT... [--agent A]\n"
-              << "  greenroom role  take ROOM ROLE [--agent A]\n"
-              << "  greenroom role  list ROOM\n"
-              << "  greenroom verify ROOM\n"
-              << "  greenroom mcp\n"
+              << "  babele serve  [--port 7788] [--data DIR] [--bind 127.0.0.1] [--token S]\n"
+              << "  babele status\n"
+              << "  babele agent  register NAME --key KEY\n"
+              << "  babele agent  list\n"
+              << "  babele rooms\n"
+              << "  babele create ROOM [--chamber]      (chamber needs --agent + --key)\n"
+              << "  babele member list ROOM\n"
+              << "  babele member add ROOM AGENT        (caller: --agent + --key, member only)\n"
+              << "  babele say    ROOM TYPE CONTENT [--agent A] [--ref N]\n"
+              << "  babele listen ROOM [--since N] [--limit M] [--follow] [--agent A]\n"
+              << "  babele wait   ROOM [--since N] [--timeout-ms 30000]\n"
+              << "  babele search QUERY [--room R] [--limit N]\n"
+              << "  babele claim  ROOM SCOPE... [--ttl 600] [--agent A]\n"
+              << "  babele release ROOM (--id N | --scope S) [--agent A]\n"
+              << "  babele claims ROOM\n"
+              << "  babele board  get ROOM KEY\n"
+              << "  babele board  set ROOM KEY VALUE [--agent A]\n"
+              << "  babele task add ROOM TITLE... [--detail D] [--agent A] [--human]\n"
+              << "  babele task list ROOM\n"
+              << "  babele task claim ROOM ID [--agent A]\n"
+              << "  babele task submit ROOM ID EVIDENCE... [--agent A]\n"
+              << "  babele task verify ROOM ID [--agent A] [--reject]\n"
+              << "  babele post   define ROOM NAME [--verify-task] [--verify-goal] [--model M]\n"
+              << "  babele post   list ROOM\n"
+              << "  babele population ROOM\n"
+              << "  babele report  ROOM [--mode hzdf|company|feudal]\n"
+              << "  babele goal  set ROOM TEXT... [--criteria C] [--oracle URL] [--agent A]\n"
+              << "  babele goal  show ROOM\n"
+              << "  babele goal  achieve ROOM EVIDENCE... [--agent A]\n"
+              << "  babele goal  verify ROOM [--agent A] [--reject]\n"
+              << "  babele goal  abandon ROOM REASON... [--agent A]\n"
+              << "  babele gen   ROOM\n"
+              << "  babele gen   advance ROOM NOTE... [--agent A]\n"
+              << "  babele gen   chronicle ROOM TEXT... [--agent A]\n"
+              << "  babele role  take ROOM ROLE [--agent A]\n"
+              << "  babele role  list ROOM\n"
+              << "  babele verify ROOM\n"
+              << "  babele mcp\n"
               << "\n"
               << "types: say plan fact ask answer done task goal gen role\n"
               << "posts: commander recorder executor reviewer tester + custom (post define)\n"
-              << "env:   GREENROOM_URL (default http://127.0.0.1:7788)\n"
-              << "       GREENROOM_TOKEN (Bearer token when serve runs with --token)\n"
-              << "       GREENROOM_AGENT (default --agent, else 'anon')\n"
-              << "       GREENROOM_KEY (identity key; pairs with --agent for chambers)\n"
+              << "env:   BABELE_URL (default http://127.0.0.1:7788)\n"
+              << "       BABELE_TOKEN (Bearer token when serve runs with --token)\n"
+              << "       BABELE_AGENT (default --agent, else 'anon')\n"
+              << "       BABELE_KEY (identity key; pairs with --agent for chambers)\n"
               << "see PROTOCOL.md for the full protocol.\n";
 }
 
@@ -76,7 +76,7 @@ struct Target {
 
 Target parseTarget() {
     Target t;
-    std::string url = envOr("GREENROOM_URL", "http://127.0.0.1:7788");
+    std::string url = envOr("BABELE_URL", "http://127.0.0.1:7788");
     const std::string prefix = "http://";
     std::string rest = url.compare(0, prefix.size(), prefix) == 0 ? url.substr(prefix.size()) : url;
     size_t colon = rest.rfind(':');
@@ -168,7 +168,7 @@ bool hasFlag(const Parsed& p, const std::string& key) {
 std::string defaultAgent(const Parsed& p) {
     std::string a = flag(p, "agent");
     if (!a.empty()) return a;
-    return envOr("GREENROOM_AGENT", "anon");
+    return envOr("BABELE_AGENT", "anon");
 }
 
 std::string hhmmss(long long tsMs) {
@@ -195,22 +195,22 @@ void printMsg(const Json& m) {
 }
 
 // Identity headers for this invocation (set once in runCli from --key /
-// GREENROOM_KEY + the agent name). Sent on every request; the server only
+// BABELE_KEY + the agent name). Sent on every request; the server only
 // honors them for chambers and agent registration.
 std::map<std::string, std::string> gIdentity;
 
 ClientResult httpGet(const Target& t, const std::string& target) {
-    return httpClient(t.host, t.port, "GET", target, "", envOr("GREENROOM_TOKEN", ""), 0,
+    return httpClient(t.host, t.port, "GET", target, "", envOr("BABELE_TOKEN", ""), 0,
                       gIdentity);
 }
 
 ClientResult httpPost(const Target& t, const std::string& target, const std::string& body) {
-    return httpClient(t.host, t.port, "POST", target, body, envOr("GREENROOM_TOKEN", ""), 0,
+    return httpClient(t.host, t.port, "POST", target, body, envOr("BABELE_TOKEN", ""), 0,
                       gIdentity);
 }
 
 ClientResult httpPut(const Target& t, const std::string& target, const std::string& body) {
-    return httpClient(t.host, t.port, "PUT", target, body, envOr("GREENROOM_TOKEN", ""), 0,
+    return httpClient(t.host, t.port, "PUT", target, body, envOr("BABELE_TOKEN", ""), 0,
                       gIdentity);
 }
 
@@ -218,7 +218,7 @@ int cmdServe(const Parsed& p) {
     int port = static_cast<int>(flagNum(p, "port", 7788));
     std::string data = flag(p, "data", defaultDataDir());
     std::string bind = flag(p, "bind", "127.0.0.1");
-    std::string token = flag(p, "token", envOr("GREENROOM_TOKEN", ""));
+    std::string token = flag(p, "token", envOr("BABELE_TOKEN", ""));
     if ((bind != "127.0.0.1" && bind != "localhost" && bind != "::1") && token.empty()) {
         std::cerr << "warning: binding " << bind << " WITHOUT a token — anyone on the network "
                   << "can read/write every room. Pass --token <secret>.\n";
@@ -226,7 +226,7 @@ int cmdServe(const Parsed& p) {
     RoomStore store(data);
     std::string err;
     HttpServer srv(bind, port, makeApiRouter(store, token));
-    std::cerr << "greenroom " << VERSION << " serving on http://" << bind << ":" << port
+    std::cerr << "babele " << VERSION << " serving on http://" << bind << ":" << port
               << "  (data: " << data << ")"
               << (token.empty() ? "" : "  (auth: token required)") << "\n";
     std::cerr << "web UI: http://" << bind << ":" << port << "/\n";
@@ -320,15 +320,15 @@ int runCli(const std::vector<std::string>& args) {
             return 1;
         if (cmd == "serve") return cmdServe(p);
 
-        // Identity headers for this invocation: --key (or GREENROOM_KEY)
+        // Identity headers for this invocation: --key (or BABELE_KEY)
         // paired with the agent name. The server verifies both against the
         // registry; chambers refuse requests without them.
         {
             std::string key = flag(p, "key");
-            if (key.empty()) key = envOr("GREENROOM_KEY", "");
+            if (key.empty()) key = envOr("BABELE_KEY", "");
             if (!key.empty()) {
-                gIdentity["X-GR-Agent"] = defaultAgent(p);
-                gIdentity["X-GR-Key"] = key;
+                gIdentity["X-Babele-Agent"] = defaultAgent(p);
+                gIdentity["X-Babele-Key"] = key;
             }
         }
 
@@ -352,7 +352,7 @@ int runCli(const std::vector<std::string>& args) {
                     return 1;
                 }
                 std::string key = flag(p, "key");
-                if (key.empty()) key = envOr("GREENROOM_KEY", "");
+                if (key.empty()) key = envOr("BABELE_KEY", "");
                 if (key.empty()) {
                     std::cerr << "error: agent register needs --key KEY (8..128 chars)\n";
                     return 1;

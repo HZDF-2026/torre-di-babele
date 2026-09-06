@@ -6,10 +6,10 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot\..
 
-$exe = "dist\greenroom.exe"
+$exe = "dist\babele.exe"
 if (-not (Test-Path $exe)) { Write-Host "FAIL: build first (build.ps1)"; exit 1 }
 
-$data = Join-Path $env:TEMP ("greenroom-it-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+$data = Join-Path $env:TEMP ("babele-it-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
 New-Item -ItemType Directory -Path $data | Out-Null
 $port = 7791
 $tok = "it-token-123"
@@ -68,7 +68,7 @@ try {
 
     # --- P1: auth ---------------------------------------------------------
     Check "401 without token" ((Status "/v1/status") -eq "401")
-    Check "200 with token" ((Api "GET" "/v1/status").name -eq "greenroom")
+    Check "200 with token" ((Api "GET" "/v1/status").name -eq "babele")
     Check "401 with wrong token" ((Status "/v1/status") -eq "401")
 
     # --- P3: web UI shell without auth -------------------------------------
@@ -325,55 +325,55 @@ try {
     Check "API report bad mode refused" ($r._status -ge 400 -and (($r.error -join "") -match "mode"))
 
     # --- MCP: tools/list has all tools --------------------------------------
-    $env:GREENROOM_URL = $base
-    $env:GREENROOM_TOKEN = $tok
+    $env:BABELE_URL = $base
+    $env:BABELE_TOKEN = $tok
     $init = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"it","version":"0"}}}'
     $listReq = '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
     $mcpOut = ($init + "`n" + $listReq + "`n") | & $exe mcp
     $toolsLine = ($mcpOut | Where-Object { $_ -match '"id":2' }) -join ""
-    Check "MCP tools/list has greenroom_verify" ($toolsLine.Contains("greenroom_verify"))
-    Check "MCP tools/list has greenroom_task" ($toolsLine.Contains("greenroom_task"))
-    Check "MCP tools/list has greenroom_wait" ($toolsLine.Contains("greenroom_wait"))
-    Check "MCP tools/list has greenroom_search" ($toolsLine.Contains("greenroom_search"))
-    Check "MCP tools/list has greenroom_society" ($toolsLine.Contains("greenroom_society"))
-    Check "MCP tools/list has greenroom_report" ($toolsLine.Contains("greenroom_report"))
+    Check "MCP tools/list has babele_verify" ($toolsLine.Contains("babele_verify"))
+    Check "MCP tools/list has babele_task" ($toolsLine.Contains("babele_task"))
+    Check "MCP tools/list has babele_wait" ($toolsLine.Contains("babele_wait"))
+    Check "MCP tools/list has babele_search" ($toolsLine.Contains("babele_search"))
+    Check "MCP tools/list has babele_society" ($toolsLine.Contains("babele_society"))
+    Check "MCP tools/list has babele_report" ($toolsLine.Contains("babele_report"))
 
     # --- MCP: task/search/wait round-trips through the proxy ----------------
-    $call = '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"greenroom_task","arguments":{"action":"create","room":"it-room","title":"mcp task","agent":"eve"}}}'
+    $call = '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"babele_task","arguments":{"action":"create","room":"it-room","title":"mcp task","agent":"eve"}}}'
     $mcpOut = ($init + "`n" + $call + "`n") | & $exe mcp
     $callLine = ($mcpOut | Where-Object { $_ -match '"id":3' }) -join ""
-    Check "MCP greenroom_task create" ($callLine.Contains("mcp task") -and $callLine.Contains("open"))
+    Check "MCP babele_task create" ($callLine.Contains("mcp task") -and $callLine.Contains("open"))
 
-    $callSearch = '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"greenroom_search","arguments":{"query":"retry logic"}}}'
+    $callSearch = '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"babele_search","arguments":{"query":"retry logic"}}}'
     $mcpOut = ($init + "`n" + $callSearch + "`n") | & $exe mcp
     $searchLine = ($mcpOut | Where-Object { $_ -match '"id":4' }) -join ""
-    Check "MCP greenroom_search" ($searchLine.Contains("retry logic"))
+    Check "MCP babele_search" ($searchLine.Contains("retry logic"))
 
-    $callWait = '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"greenroom_wait","arguments":{"room":"it-room","since":99,"timeout_ms":500}}}'
+    $callWait = '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"babele_wait","arguments":{"room":"it-room","since":99,"timeout_ms":500}}}'
     $mcpOut = ($init + "`n" + $callWait + "`n") | & $exe mcp
     $waitLine = ($mcpOut | Where-Object { $_ -match '"id":5' }) -join ""
-    Check "MCP greenroom_wait timeout" ($waitLine.Contains("messages"))
+    Check "MCP babele_wait timeout" ($waitLine.Contains("messages"))
 
-    $callSoc = '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"greenroom_society","arguments":{"action":"status","room":"soc-room"}}}'
+    $callSoc = '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"babele_society","arguments":{"action":"status","room":"soc-room"}}}'
     $mcpOut = ($init + "`n" + $callSoc + "`n") | & $exe mcp
     $socLine = ($mcpOut | Where-Object { $_ -match '"id":6' }) -join ""
-    Check "MCP greenroom_society status" ($socLine.Contains("soc-room") -and $socLine.Contains("abandoned") -and $socLine.Contains("reviewer"))
+    Check "MCP babele_society status" ($socLine.Contains("soc-room") -and $socLine.Contains("abandoned") -and $socLine.Contains("reviewer"))
 
-    $callCh = '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"greenroom_society","arguments":{"action":"gen-chronicle","room":"soc2","agent":"mcp-rec","chronicle":"mcp chronicle entry"}}}'
+    $callCh = '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"babele_society","arguments":{"action":"gen-chronicle","room":"soc2","agent":"mcp-rec","chronicle":"mcp chronicle entry"}}}'
     $mcpOut = ($init + "`n" + $callCh + "`n") | & $exe mcp
     $chLine = ($mcpOut | Where-Object { $_ -match '"id":7' }) -join ""
-    Check "MCP greenroom_society gen-chronicle" ($chLine.Contains("mcp chronicle entry") -and $chLine.Contains("mcp-rec"))
+    Check "MCP babele_society gen-chronicle" ($chLine.Contains("mcp chronicle entry") -and $chLine.Contains("mcp-rec"))
 
-    $callRep = '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"greenroom_report","arguments":{"room":"soc2"}}}'
+    $callRep = '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"babele_report","arguments":{"room":"soc2"}}}'
     $mcpOut = ($init + "`n" + $callRep + "`n") | & $exe mcp
     $repLine = ($mcpOut | Where-Object { $_ -match '"id":8' }) -join ""
-    Check "MCP greenroom_report default hzdf" ($repLine.Contains("HZDF-2026 report") -and $repLine.Contains("phase history") -and $repLine.Contains("mcp chronicle entry"))
+    Check "MCP babele_report default hzdf" ($repLine.Contains("HZDF-2026 report") -and $repLine.Contains("phase history") -and $repLine.Contains("mcp chronicle entry"))
 
-    $callRep2 = '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"greenroom_report","arguments":{"room":"soc2","mode":"feudal"}}}'
+    $callRep2 = '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"babele_report","arguments":{"room":"soc2","mode":"feudal"}}}'
     $mcpOut = ($init + "`n" + $callRep2 + "`n") | & $exe mcp
     $rep2 = ($mcpOut | Where-Object { $_ -match '"id":9' }) -join ""
     $rep2d = [Regex]::Unescape($rep2)  # decode \uXXXX escapes for the CJK check
-    Check "MCP greenroom_report feudal" ($rep2d.Contains("奏为恭报") -and $rep2d.Contains("如蒙圣鉴"))
+    Check "MCP babele_report feudal" ($rep2d.Contains("奏为恭报") -and $rep2d.Contains("如蒙圣鉴"))
 
     # --- CLI against the token server ---------------------------------------
     $cliOut = (& $exe search "util.cpp" 2>&1) -join ""

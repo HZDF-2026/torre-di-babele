@@ -1,4 +1,4 @@
-// cli.h — greenroom command-line interface.
+// cli.h — babele command-line interface.
 #ifndef GR_CLI_H
 #define GR_CLI_H
 

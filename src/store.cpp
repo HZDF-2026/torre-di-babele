@@ -511,7 +511,7 @@ bool RoomStore::createRoom(const std::string& room, bool chamber,
     // room directory behind.
     if (chamber && creator.empty())
         throw std::runtime_error("a chamber needs a registered creator — send identity "
-                                 "headers (X-GR-Agent/X-GR-Key)");
+                                 "headers (X-Babele-Agent/X-Babele-Key)");
     std::lock_guard<std::mutex> lock(mu_);
     if (!validRoomName(room) || roomExists(room)) return false;
     if (!makeDirs(roomDir(room))) return false;
@@ -1550,13 +1550,13 @@ void RoomStore::birthGenLocked(const std::string& room, RoomData& rd) {
     std::string detail;
     if (n > 1 && prevHasChronicle) {
         detail = "The god goal is still open. Start from the chronicles of past "
-                 "generations (`greenroom gen <room>`) — the distilled record of what "
+                 "generations (`babele gen <room>`) — the distilled record of what "
                  "was tried, what worked and what remains; do NOT re-read the full "
-                 "history (use `greenroom search` for cold storage). Assess the gap, "
+                 "history (use `babele search` for cold storage). Assess the gap, "
                  "then create and distribute this generation's tasks.";
     } else if (n > 1 && anyChronicle) {
         detail = "The god goal is still open. The previous generation left no "
-                 "chronicle — read the chronicles of older generations (`greenroom "
+                 "chronicle — read the chronicles of older generations (`babele "
                  "gen <room>`) and the recent history since they were written "
                  "(listen --since 0), assess the gap, then create and distribute "
                  "this generation's tasks.";

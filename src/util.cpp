@@ -20,7 +20,7 @@
 
 namespace gr {
 
-const char* const VERSION = "0.3.1";
+const char* const VERSION = "0.5.0";
 
 long long nowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -163,7 +163,7 @@ std::string selfExePath() {
 #ifdef _WIN32
     char buf[MAX_PATH];
     DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
-    return n > 0 ? std::string(buf, n) : std::string("greenroom");
+    return n > 0 ? std::string(buf, n) : std::string("babele");
 #else
     char buf[4096];
     ssize_t n = ::readlink("/proc/self/exe", buf, sizeof buf - 1);
@@ -171,7 +171,7 @@ std::string selfExePath() {
         buf[n] = 0;
         return std::string(buf);
     }
-    return std::string("greenroom");
+    return std::string("babele");
 #endif
 }
 
@@ -227,15 +227,15 @@ bool spawnDetached(const std::vector<std::string>& argv, std::string& errOut) {
 }
 
 std::string defaultDataDir() {
-    std::string d = envOr("GREENROOM_DATA", "");
+    std::string d = envOr("BABELE_DATA", "");
     if (!d.empty()) return d;
 #ifdef _WIN32
     const char* home = std::getenv("USERPROFILE");
 #else
     const char* home = std::getenv("HOME");
 #endif
-    if (!home) return "greenroom-data";
-    return std::string(home) + "/.greenroom";
+    if (!home) return "babele-data";
+    return std::string(home) + "/.babele";
 }
 
 }  // namespace gr

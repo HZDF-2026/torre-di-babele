@@ -1,4 +1,4 @@
-// util.h — greenroom platform layer: time, file IO, paths, env.
+// util.h — babele platform layer: time, file IO, paths, env.
 #ifndef GR_UTIL_H
 #define GR_UTIL_H
 
@@ -40,13 +40,13 @@ bool validRoomName(const std::string& name);
 // True when key is a safe board key: [a-zA-Z0-9._/-], 1..128 chars.
 bool validBoardKey(const std::string& key);
 
-// Absolute path of the running executable (best effort; "greenroom" fallback).
+// Absolute path of the running executable (best effort; "babele" fallback).
 std::string selfExePath();
 
 // Start a detached process that survives its parent. No inherited handles.
 bool spawnDetached(const std::vector<std::string>& argv, std::string& errOut);
 
-// $GREENROOM_DATA, else ~/.greenroom (USERPROFILE on Windows). Absolute.
+// $BABELE_DATA, else ~/.babele (USERPROFILE on Windows). Absolute.
 std::string defaultDataDir();
 
 }  // namespace gr
